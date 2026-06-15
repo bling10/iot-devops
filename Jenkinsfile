@@ -7,18 +7,11 @@ pipeline {
     }
     
     environment {
-        PROJECT_DIR = "/data/devops/app-workspace/sample_project"
+        PROJECT_DIR = "${WORKSPACE}"
         VERSION = "v1.0.${BUILD_NUMBER}"
     }
 
     stages {
-        stage('Checkout') {
-            steps {
-                echo 'Checking out code from Gitlab (mocked for now, using local directory)'
-                // git url: 'http://gitlab/root/sample_project.git', branch: 'main'
-            }
-        }
-        
         stage('Build Firmware') {
             steps {
                 echo 'Building firmware using ESP-IDF...'
