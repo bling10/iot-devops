@@ -156,4 +156,4 @@ void app_main(void) {
 
     // 4. 创建业务线程
     xTaskCreate(vTaskSensor, "Task_Sensor", 8192, NULL, 3, NULL); // 栈深度提升至 8KB，防止 MQTT 内部调用栈溢出
-}
+}// trigger ota test
