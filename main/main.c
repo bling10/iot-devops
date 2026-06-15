@@ -137,6 +137,7 @@ void vTaskSensor(void *pvParameters) {
 void app_main(void) {
     ESP_LOGI(TAG, "=========================================");
     ESP_LOGI(TAG, "🚀 嵌入式 IoT 终端启动 | 基础网络状态机打通");
+    ESP_LOGI(TAG, "📦 当前固件版本: %s", "v1.1.0-webhook-test");
     ESP_LOGI(TAG, "=========================================");
 
     // 1. 初始化 NVS
