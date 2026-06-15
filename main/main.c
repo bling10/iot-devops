@@ -9,6 +9,8 @@
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
+
 #include "esp_log.h"
 #include "mqtt_client.h"
 // ===== OTA 新增头文件 =====
@@ -34,6 +36,15 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool is_mqtt_connected = false; // 🟢 【修复】volatile 保证多任务/中断间可见性
 static volatile bool is_ota_in_progress = false; // 🔒 OTA 进行中标志，防止重复触发
 static char ota_url[256] = {0};                   // 缓存 OTA 固件下载地址
+
+// ⏱️ 防变砖看门狗定时器
+TimerHandle_t rollback_timer = NULL;
+
+static void rollback_timer_cb(TimerHandle_t xTimer) {
+    ESP_LOGE(TAG, "💀 新固件 3 分钟内未能连上 MQTT，判定为死锁/断网！触发 App Rollback 强制回退！");
+    esp_restart();
+}
+
 
 // ================= 2. OTA 空中升级核心逻辑 =================
 
@@ -307,6 +318,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "🟢 MQTT 服务器连接成功！");
             is_mqtt_connected = true;  // 🟢 【关键】联通后，业务解锁开闸
+            
+            // 【自救拆弹】连上云端说明新固件网络栈健康，取消回滚并标记为合法！
+            if (rollback_timer != NULL) {
+                xTimerStop(rollback_timer, 0);
+                ESP_LOGI(TAG, "💣 已停止变砖看门狗定时器。");
+            }
+            esp_ota_mark_app_valid_cancel_rollback();
+            ESP_LOGI(TAG, "✅ 当前固件已被标记为稳定版 (VALID)！");
+
             // 订阅 OTA 升级通知主题，用于接收 Jenkins 流水线下发的固件更新 JSON
             esp_mqtt_client_subscribe(mqtt_client, OTA_TOPIC, 1);
             ESP_LOGI(TAG, "📥 已订阅 OTA 主题: %s", OTA_TOPIC);
@@ -408,6 +428,11 @@ void app_main(void) {
         ESP_LOGI(TAG, "💾 当前运行分区: %s (地址: 0x%08"PRIx32")", running->label, running->address);
     }
     ESP_LOGI(TAG, "=========================================");
+
+    // 0. 启动防变砖生命周期看门狗 (3 分钟)
+    ESP_LOGI(TAG, "⏱️ 启动防变砖看门狗，如果 3 分钟内未连上 MQTT，将自动回退到上一版固件！");
+    rollback_timer = xTimerCreate("rollback_timer", pdMS_TO_TICKS(180000), pdFALSE, NULL, rollback_timer_cb);
+    xTimerStart(rollback_timer, 0);
 
     // 1. 初始化 NVS
     esp_err_t ret = nvs_flash_init();
