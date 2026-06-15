@@ -47,8 +47,10 @@ pipeline {
   "md5": "${FIRMWARE_MD5}"
 }
 EOF
-                    # Install Mosquitto clients if needed
-                    apt-get update && apt-get install -y mosquitto-clients
+                    # Install Mosquitto clients if not already present
+                    if ! command -v mosquitto_pub &> /dev/null; then
+                        apt-get update && apt-get install -y mosquitto-clients
+                    fi
                     
                     # Publish MQTT message
                     mosquitto_pub -h 192.168.100.60 -p 1883 -t "device/esp32/ota" -f ota_notify.json
