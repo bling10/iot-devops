@@ -11,22 +11,273 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "mqtt_client.h"
+// ===== OTA 新增头文件 =====
+#include "esp_ota_ops.h"        // OTA 操作 API：写分区、设置启动分区
+#include "esp_http_client.h"    // HTTP 客户端：从 Nginx 下载固件
+#include "esp_app_desc.h"       // 读取当前固件版本描述
+#include "cJSON.h"              // 解析 Jenkins 推送的 OTA JSON 消息
 
 // ================= 1. 核心参数配置区 =================
 // ⚠️ 测试阶段硬编码凭据，正式发布时应迁移至 menuconfig (Kconfig) 或 NVS 分区
-#define WIFI_SSID      "wifi"                  // ⚠️ 确保是 2.4GHz 频段的热点
-#define WIFI_PASS      "888888889999"          // ⚠️ WiFi 密码
-#define MQTT_BROKER    "mqtt://192.168.249.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
-#define MQTT_TOPIC     "telemetry/sensors"
-#define OTA_TOPIC      "device/esp32/ota"      // OTA 升级通知订阅主题
+#define WIFI_SSID          "wifi"                  // ⚠️ 确保是 2.4GHz 频段的热点
+#define WIFI_PASS          "888888889999"          // ⚠️ WiFi 密码
+#define MQTT_BROKER        "mqtt://192.168.249.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
+#define MQTT_TOPIC         "telemetry/sensors"
+#define OTA_TOPIC          "device/esp32/ota"      // OTA 升级通知订阅主题
+#define FIRMWARE_VERSION   "v1.0.0"                // 固件版本号（Jenkins 编译时会自动替换）
+#define OTA_BUF_SIZE       1024                    // OTA 下载缓冲区大小
 
 static const char *TAG = "IOT_NODE";
 
 // 全局句柄与真实连接状态位
 esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool is_mqtt_connected = false; // 🟢 【修复】volatile 保证多任务/中断间可见性
+static volatile bool is_ota_in_progress = false; // 🔒 OTA 进行中标志，防止重复触发
+static char ota_url[256] = {0};                   // 缓存 OTA 固件下载地址
 
-// ================= 2. 网络状态机事件回调 =================
+// ================= 2. OTA 空中升级核心逻辑 =================
+
+/**
+ * OTA 下载与烧录任务
+ * 
+ * 工作流程：
+ * 1. 通过 HTTP GET 从 Nginx 下载固件二进制流
+ * 2. 获取下一个可用的 OTA 分区（ota_0 或 ota_1）
+ * 3. 逐块写入 Flash
+ * 4. 写入完成后标记新分区为启动分区
+ * 5. 自动重启，运行新固件
+ */
+static void ota_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "🚀 ========== OTA 升级任务启动 ==========");
+    ESP_LOGI(TAG, "📥 固件下载地址: %s", ota_url);
+
+    esp_err_t err;
+
+    // ---------- 1. 配置 HTTP 客户端 ----------
+    esp_http_client_config_t http_config = {
+        .url = ota_url,
+        .timeout_ms = 30000,  // 30 秒超时，防止网络卡死
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&http_config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "❌ HTTP 客户端初始化失败！");
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ---------- 2. 打开 HTTP 连接 ----------
+    err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ HTTP 连接失败: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "📊 HTTP 状态码: %d | 固件大小: %d 字节", status_code, content_length);
+
+    if (status_code != 200) {
+        ESP_LOGE(TAG, "❌ HTTP 请求异常，状态码: %d", status_code);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ---------- 3. 获取下一个可用的 OTA 分区 ----------
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "❌ 找不到可用的 OTA 分区！请检查分区表配置");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "📦 目标 OTA 分区: %s (地址: 0x%08"PRIx32", 大小: %"PRIu32" 字节)",
+             update_partition->label, update_partition->address, update_partition->size);
+
+    // ---------- 4. 开始 OTA 写入 ----------
+    esp_ota_handle_t ota_handle;
+    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ OTA 写入初始化失败: %s", esp_err_to_name(err));
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ---------- 5. 循环读取 HTTP 数据流并逐块写入 Flash ----------
+    char *buf = malloc(OTA_BUF_SIZE);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "❌ 内存分配失败！");
+        esp_ota_abort(ota_handle);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int total_read = 0;
+    int read_len;
+    int last_progress = -1;
+
+    while (1) {
+        read_len = esp_http_client_read(client, buf, OTA_BUF_SIZE);
+        if (read_len < 0) {
+            ESP_LOGE(TAG, "❌ HTTP 数据读取出错！");
+            break;
+        }
+        if (read_len == 0) {
+            // 数据读取完毕
+            if (esp_http_client_is_complete_data_received(client)) {
+                ESP_LOGI(TAG, "✅ 固件数据接收完毕！");
+            } else {
+                ESP_LOGE(TAG, "❌ 连接中断，数据不完整！");
+            }
+            break;
+        }
+
+        // 写入 Flash
+        err = esp_ota_write(ota_handle, buf, read_len);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "❌ Flash 写入失败: %s", esp_err_to_name(err));
+            break;
+        }
+
+        total_read += read_len;
+
+        // 每 10% 打印一次进度
+        if (content_length > 0) {
+            int progress = (total_read * 100) / content_length;
+            if (progress / 10 != last_progress / 10) {
+                last_progress = progress;
+                ESP_LOGI(TAG, "⏳ OTA 下载进度: %d%% (%d/%d 字节)", progress, total_read, content_length);
+            }
+        }
+    }
+
+    free(buf);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    // ---------- 6. 完成 OTA 写入 ----------
+    if (err == ESP_OK && esp_http_client_is_complete_data_received(client) == false && total_read > 0) {
+        // 部分情况下 chunked encoding 不会设 content_length，但数据可能已完整
+        ESP_LOGW(TAG, "⚠️ 数据接收标志未置位，但已读取 %d 字节，继续尝试完成 OTA", total_read);
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+            ESP_LOGE(TAG, "❌ 固件校验失败！镜像可能已损坏");
+        } else {
+            ESP_LOGE(TAG, "❌ OTA 结束失败: %s", esp_err_to_name(err));
+        }
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // ---------- 7. 设置新分区为下次启动分区 ----------
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "❌ 设置启动分区失败: %s", esp_err_to_name(err));
+        is_ota_in_progress = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "🎉 ========== OTA 升级成功！==========");
+    ESP_LOGI(TAG, "📦 新固件已写入分区: %s", update_partition->label);
+    ESP_LOGI(TAG, "🔄 3 秒后自动重启...");
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
+}
+
+/**
+ * 解析 OTA 通知 JSON 并启动升级任务
+ * 
+ * 预期 JSON 格式（由 Jenkins 流水线生成）：
+ * {
+ *   "version": "v1.0.12",
+ *   "url": "http://192.168.249.60:8081/firmware_v1.0.12.bin",
+ *   "md5": "d41d8cd98f00b204e9800998ecf8427e"
+ * }
+ */
+static void handle_ota_message(const char *data, int data_len)
+{
+    // 防止重复触发
+    if (is_ota_in_progress) {
+        ESP_LOGW(TAG, "⚠️ OTA 升级正在进行中，忽略重复通知");
+        return;
+    }
+
+    // 安全拷贝 JSON 数据（确保以 \0 结尾）
+    char *json_str = malloc(data_len + 1);
+    if (json_str == NULL) {
+        ESP_LOGE(TAG, "❌ 内存分配失败，无法解析 OTA 消息");
+        return;
+    }
+    memcpy(json_str, data, data_len);
+    json_str[data_len] = '\0';
+
+    // 解析 JSON
+    cJSON *root = cJSON_Parse(json_str);
+    free(json_str);
+
+    if (root == NULL) {
+        ESP_LOGE(TAG, "❌ OTA JSON 解析失败！");
+        return;
+    }
+
+    cJSON *version_item = cJSON_GetObjectItem(root, "version");
+    cJSON *url_item = cJSON_GetObjectItem(root, "url");
+
+    if (!cJSON_IsString(version_item) || !cJSON_IsString(url_item)) {
+        ESP_LOGE(TAG, "❌ OTA JSON 格式错误：缺少 version 或 url 字段");
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *new_version = version_item->valuestring;
+    const char *new_url = url_item->valuestring;
+
+    ESP_LOGI(TAG, "📋 收到 OTA 升级通知:");
+    ESP_LOGI(TAG, "   远端版本: %s", new_version);
+    ESP_LOGI(TAG, "   当前版本: %s", FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "   固件地址: %s", new_url);
+
+    // 版本比对：如果版本号相同则跳过
+    if (strcmp(new_version, FIRMWARE_VERSION) == 0) {
+        ESP_LOGW(TAG, "⚠️ 远端版本与当前版本一致 (%s)，跳过升级", FIRMWARE_VERSION);
+        cJSON_Delete(root);
+        return;
+    }
+
+    // 保存 URL 并启动 OTA 任务
+    strncpy(ota_url, new_url, sizeof(ota_url) - 1);
+    ota_url[sizeof(ota_url) - 1] = '\0';
+
+    is_ota_in_progress = true;
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "🔧 正在启动 OTA 下载任务...");
+    // 栈深度 8KB，OTA 任务优先级设为 5（高于传感器任务的 3）
+    xTaskCreate(ota_task, "OTA_Task", 8192, NULL, 5, NULL);
+}
+
+// ================= 3. 网络状态机事件回调 =================
 
 // 处理 WiFi 连接状态
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -61,14 +312,20 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "📨 收到 MQTT 消息 -> 主题: %.*s", event->topic_len, event->topic);
             ESP_LOGI(TAG, "📨 消息内容: %.*s", event->data_len, event->data);
-            // TODO [任务三]: 在此解析 OTA JSON，提取 url/md5，触发 esp_https_ota 流式更新
+
+            // 🔧 判断是否为 OTA 升级通知
+            if (event->topic_len == strlen(OTA_TOPIC) &&
+                strncmp(event->topic, OTA_TOPIC, event->topic_len) == 0) {
+                ESP_LOGI(TAG, "🔔 检测到 OTA 升级通知，开始处理...");
+                handle_ota_message(event->data, event->data_len);
+            }
             break;
         default:
             break;
     }
 }
 
-// ================= 3. 基础设施初始化 =================
+// ================= 4. 基础设施初始化 =================
 void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -101,7 +358,7 @@ void mqtt_app_start(void) {
     esp_mqtt_client_start(mqtt_client);
 }
 
-// ================= 4. 业务线程区 =================
+// ================= 5. 业务线程区 =================
 
 // 任务一：传感器采集与上报
 void vTaskSensor(void *pvParameters) {
@@ -133,11 +390,17 @@ void vTaskSensor(void *pvParameters) {
     }
 }
 
-// ================= 5. 系统主入口 =================
+// ================= 6. 系统主入口 =================
 void app_main(void) {
     ESP_LOGI(TAG, "=========================================");
-    ESP_LOGI(TAG, "🚀 嵌入式 IoT 终端启动 | 基础网络状态机打通");
-    ESP_LOGI(TAG, "📦 当前固件版本: %s", "v1.1.0-webhook-test");
+    ESP_LOGI(TAG, "🚀 嵌入式 IoT 终端启动 | OTA 空中升级已就绪");
+    ESP_LOGI(TAG, "📦 当前固件版本: %s", FIRMWARE_VERSION);
+
+    // 打印当前运行的 OTA 分区信息
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running != NULL) {
+        ESP_LOGI(TAG, "💾 当前运行分区: %s (地址: 0x%08"PRIx32")", running->label, running->address);
+    }
     ESP_LOGI(TAG, "=========================================");
 
     // 1. 初始化 NVS
