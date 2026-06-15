@@ -43,7 +43,7 @@ pipeline {
                     cat <<EOF > ota_notify.json
 {
   "version": "${VERSION}",
-  "url": "http://192.168.100.60:8081/firmware_${VERSION}.bin",
+  "url": "http://192.168.249.60:8081/firmware_${VERSION}.bin",
   "md5": "${FIRMWARE_MD5}"
 }
 EOF
@@ -53,7 +53,7 @@ EOF
                     fi
                     
                     # Publish MQTT message
-                    mosquitto_pub -h 192.168.100.60 -p 1883 -t "device/esp32/ota" -f ota_notify.json
+                    mosquitto_pub -h 192.168.249.60 -p 1883 -t "device/esp32/ota" -f ota_notify.json
                 '''
             }
         }

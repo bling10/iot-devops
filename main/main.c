@@ -16,7 +16,7 @@
 // ⚠️ 测试阶段硬编码凭据，正式发布时应迁移至 menuconfig (Kconfig) 或 NVS 分区
 #define WIFI_SSID      "wifi"                  // ⚠️ 确保是 2.4GHz 频段的热点
 #define WIFI_PASS      "888888889999"          // ⚠️ WiFi 密码
-#define MQTT_BROKER    "mqtt://192.168.100.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
+#define MQTT_BROKER    "mqtt://192.168.249.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
 #define MQTT_TOPIC     "telemetry/sensors"
 #define OTA_TOPIC      "device/esp32/ota"      // OTA 升级通知订阅主题
 
