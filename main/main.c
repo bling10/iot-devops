@@ -432,7 +432,12 @@ void app_main(void) {
     // 0. 启动防变砖生命周期看门狗 (3 分钟)
     ESP_LOGI(TAG, "⏱️ 启动防变砖看门狗，如果 3 分钟内未连上 MQTT，将自动回退到上一版固件！");
     rollback_timer = xTimerCreate("rollback_timer", pdMS_TO_TICKS(180000), pdFALSE, NULL, rollback_timer_cb);
-    xTimerStart(rollback_timer, 0);
+    if (rollback_timer != NULL) {
+        xTimerStart(rollback_timer, 0);
+    } else {
+        ESP_LOGE(TAG, "❌ 无法创建防变砖定时器，系统内存不足，主动重启回滚...");
+        esp_restart();
+    }
 
     // 1. 初始化 NVS
     esp_err_t ret = nvs_flash_init();
