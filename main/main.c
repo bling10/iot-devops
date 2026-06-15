@@ -291,6 +291,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "🔹 WiFi 连接成功! 获取到本地 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // 【核心修改】确保获取到 IP 后才启动/恢复 MQTT
+        if (mqtt_client == NULL) {
+            ESP_LOGI(TAG, "🚀 网络就绪，首次启动 MQTT 客户端...");
+            mqtt_app_start();
+        }
     }
 }
 
@@ -411,11 +417,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. 启动 WiFi STA 模式
+    // 2. 启动 WiFi STA 模式（连接成功后会在回调中启动 MQTT）
     wifi_init_sta();
-    
-    // 3. 启动 MQTT 客户端
-    mqtt_app_start();
 
     // 4. 创建业务线程
     xTaskCreate(vTaskSensor, "Task_Sensor", 8192, NULL, 3, NULL); // 栈深度提升至 8KB，防止 MQTT 内部调用栈溢出
