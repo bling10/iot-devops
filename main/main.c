@@ -19,6 +19,8 @@
 #include "esp_app_desc.h"       // 读取当前固件版本描述
 #include "cJSON.h"              // 解析 Jenkins 推送的 OTA JSON 消息
 
+void mqtt_app_start(void);      // 前置声明
+
 // ================= 1. 核心参数配置区 =================
 // ⚠️ 测试阶段硬编码凭据，正式发布时应迁移至 menuconfig (Kconfig) 或 NVS 分区
 #define WIFI_SSID          "wifi"                  // ⚠️ 确保是 2.4GHz 频段的热点
