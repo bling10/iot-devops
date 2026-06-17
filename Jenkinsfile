@@ -21,6 +21,7 @@ pipeline {
                     # 将固件版本号同步为 Jenkins 构建版本（用于 OTA 版本比对）
                     sed -i "s/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION   \\"${VERSION}\\"/" main/main.c
                     echo "📦 固件版本已同步为: ${VERSION}"
+                    rm -rf build/
                     idf.py set-target esp32
                     idf.py build
                 '''
