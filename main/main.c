@@ -298,9 +298,8 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "❌ WiFi 断开，3秒后尝试重连...");
+        ESP_LOGW(TAG, "❌ WiFi 断开，尝试重连...");
         is_mqtt_connected = false; // WiFi 断开，MQTT 必然失效
-        vTaskDelay(pdMS_TO_TICKS(3000)); // 【优化】延时 3 秒再连，防止疯狂空转死循环
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
