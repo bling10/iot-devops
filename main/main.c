@@ -397,8 +397,9 @@ void vTaskSensor(void *pvParameters) {
     while (1) {
         // 🔴 【核心修改】只认状态位，不认空指针
         if (is_mqtt_connected) {
-            mock_temp += 0.5;
-            if(mock_temp > 30.0) mock_temp = 25.0;
+            // mock_temp += 0.5;
+            // if(mock_temp > 30.0) mock_temp = 25.0;
+            mock_temp = 99.9; // 制造极限异常温度
 
             // 获取 Wi-Fi RSSI
             wifi_ap_record_t ap;
