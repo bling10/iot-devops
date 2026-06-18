@@ -392,7 +392,7 @@ void mqtt_app_start(void) {
 // 任务一：传感器采集与上报
 void vTaskSensor(void *pvParameters) {
     char payload[256];
-    float mock_temp = 25.0;
+    float mock_temp = 99.0;
     float mock_hum = 50.0;
 
     while (1) {
