@@ -4,6 +4,7 @@
 #include <string.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -390,7 +391,7 @@ void mqtt_app_start(void) {
 
 // 任务一：传感器采集与上报
 void vTaskSensor(void *pvParameters) {
-    char payload[128];
+    char payload[256];
     float mock_temp = 25.0;
     float mock_hum = 50.0;
 
@@ -400,7 +401,22 @@ void vTaskSensor(void *pvParameters) {
             mock_temp += 0.5;
             if(mock_temp > 30.0) mock_temp = 25.0;
 
-            snprintf(payload, sizeof(payload), "{\"temperature\": %.2f, \"humidity\": %.2f}", mock_temp, mock_hum);
+            // 获取 Wi-Fi RSSI
+            wifi_ap_record_t ap;
+            int8_t rssi = 0;
+            if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+                rssi = ap.rssi;
+            }
+
+            // 获取可用堆内存
+            uint32_t free_heap = esp_get_free_heap_size();
+
+            // 获取连续运行时间 (秒)
+            uint32_t uptime_sec = (uint32_t)(esp_timer_get_time() / 1000000);
+
+            snprintf(payload, sizeof(payload), 
+                "{\"temperature\": %.2f, \"humidity\": %.2f, \"rssi\": %d, \"free_heap\": %lu, \"uptime_sec\": %lu, \"version\": \"%s\"}", 
+                mock_temp, mock_hum, rssi, free_heap, uptime_sec, FIRMWARE_VERSION);
             
             int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
             if (msg_id < 0) {
