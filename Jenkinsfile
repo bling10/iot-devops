@@ -62,4 +62,22 @@ EOF
             }
         }
     }
+    post {
+        success {
+            echo '✅ Pipeline execution successful, sending DingTalk notification...'
+            sh """
+                curl -H 'Content-Type: application/json' \\
+                     -d '{"msgtype": "markdown", "markdown": {"title":"🚀 OTA 固件发布成功", "text":"### 🚀 ESP32 OTA 固件发布成功\\n\\n**版本号:** `${VERSION}`\\n\\n**状态:** ✅ 构建与推送完成\\n\\n设备即将开始自动拉取升级。"}}' \\
+                     YOUR_DINGTALK_WEBHOOK_URL
+            """
+        }
+        failure {
+            echo '❌ Pipeline execution failed, sending DingTalk alert...'
+            sh """
+                curl -H 'Content-Type: application/json' \\
+                     -d '{"msgtype": "markdown", "markdown": {"title":"💥 固件构建失败", "text":"### 💥 ESP32 固件构建失败\\n\\n**版本号:** `${VERSION}`\\n\\n**状态:** ❌ 编译不通过或环境异常\\n\\n请开发人员立即检查 Jenkins 日志！"}}' \\
+                     YOUR_DINGTALK_WEBHOOK_URL
+            """
+        }
+    }
 }
