@@ -1,4 +1,48 @@
-build/
-managed_components/
-dependencies.lock
-sdkconfig.old
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+
+# ESP-IDF generated files
+firmware/**/build/
+firmware/**/managed_components/
+firmware/**/dependencies.lock
+firmware/**/sdkconfig
+firmware/**/sdkconfig.old
+firmware/**/compile_commands.json
+*.bin
+*.elf
+*.map
+*.hex
+
+# Runtime files and databases
+*.log
+*.pid
+*.sock
+*.tmp
+*.cache
+*.db
+*.sqlite
+*.sqlite3
+*.bolt
+*.wal
+
+# Downloaded archives and local backups
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.bak
+
+# IDE and OS local state
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

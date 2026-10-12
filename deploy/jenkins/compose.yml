@@ -1,0 +1,24 @@
+services:
+  jenkins:
+    image: jenkins/jenkins
+    container_name: jenkins
+    ports:
+      - "${JENKINS_HTTP_PORT}:8080"
+      - "${JENKINS_AGENT_PORT}:50000"
+    volumes:
+      - "${RUNTIME_ROOT}/jenkins/home:/var/jenkins_home"
+      - /usr/bin/docker:/usr/bin/docker
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /etc/docker/daemon.json:/etc/docker/daemon.json:ro
+    restart: unless-stopped
+    networks:
+      - jenkins-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+networks:
+  jenkins-net:
+    driver: bridge

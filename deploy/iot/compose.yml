@@ -1,0 +1,104 @@
+services:
+  iot-nginx:
+    image: nginx:alpine
+    container_name: iot-nginx
+    ports:
+      - "${NGINX_PORT}:80"
+    volumes:
+      - "${ARTIFACT_ROOT}/firmware:/usr/share/nginx/html:ro"
+    restart: always
+    networks:
+      - iot-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  iot-mqtt:
+    image: eclipse-mosquitto:2
+    container_name: iot-mqtt
+    ports:
+      - "${MQTT_PORT}:1883"
+    volumes:
+      - "${PROJECT_ROOT}/deploy/iot/mosquitto:/mosquitto/config:ro"
+      - "${RUNTIME_ROOT}/mqtt/data:/mosquitto/data"
+      - "${RUNTIME_ROOT}/mqtt/logs:/mosquitto/log"
+    restart: always
+    networks:
+      - iot-net
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -E -i healthcheck -W 3 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: iot-influxdb
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: "${INFLUXDB_USERNAME}"
+      DOCKER_INFLUXDB_INIT_PASSWORD: "${INFLUXDB_PASSWORD}"
+      DOCKER_INFLUXDB_INIT_ORG: "${INFLUXDB_ORG}"
+      DOCKER_INFLUXDB_INIT_BUCKET: "${INFLUXDB_BUCKET}"
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: "${INFLUXDB_TOKEN}"
+      DOCKER_INFLUXDB_INIT_RETENTION: "${INFLUXDB_RETENTION}"
+    volumes:
+      - "${RUNTIME_ROOT}/influxdb/data:/var/lib/influxdb2"
+      - "${RUNTIME_ROOT}/influxdb/config:/etc/influxdb2"
+    restart: always
+    networks:
+      - iot-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  telegraf:
+    image: telegraf:alpine
+    container_name: iot-telegraf
+    environment:
+      INFLUXDB_TOKEN: "${INFLUXDB_TOKEN}"
+      INFLUXDB_ORG: "${INFLUXDB_ORG}"
+      INFLUXDB_BUCKET: "${INFLUXDB_BUCKET}"
+    volumes:
+      - "${PROJECT_ROOT}/deploy/iot/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro"
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - influxdb
+      - iot-mqtt
+    restart: always
+    networks:
+      - iot-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: 128M
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: iot-grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    volumes:
+      - "${RUNTIME_ROOT}/grafana:/var/lib/grafana"
+    restart: always
+    networks:
+      - iot-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+networks:
+  iot-net:
+    driver: bridge

@@ -1,11 +1,10 @@
 {
-	"folders": [
-		{
-			"path": "G:/project/esp"
-		},
-		{
-			"path": ".."
-		}
-	],
-	"settings": {}
+  "folders": [
+    {
+      "path": ".."
+    }
+  ],
+  "settings": {
+    "idf.buildPath": "${workspaceFolder}/firmware/esp32-node/build"
+  }
 }
