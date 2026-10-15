@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:13
+    image: postgres:13.23
     container_name: sonar-db
     ports:
       - "${POSTGRES_PORT}:5432"
@@ -13,7 +13,7 @@ services:
       - "${RUNTIME_ROOT}/sonarqube/postgres:/var/lib/postgresql/data"
 
   sonarqube:
-    image: sonarqube:9.9-community
+    image: sonarqube:9.9.8-community
     container_name: sonarqube
     depends_on:
       - db

@@ -1,6 +1,6 @@
 services:
   iot-nginx:
-    image: nginx:alpine
+    image: nginx:1.31.1-alpine
     container_name: iot-nginx
     ports:
       - "${NGINX_PORT}:80"
@@ -16,7 +16,7 @@ services:
           memory: 256M
 
   iot-mqtt:
-    image: eclipse-mosquitto:2
+    image: eclipse-mosquitto:2.1.2-alpine
     container_name: iot-mqtt
     ports:
       - "${MQTT_PORT}:1883"
@@ -39,7 +39,7 @@ services:
           memory: 512M
 
   influxdb:
-    image: influxdb:2.7-alpine
+    image: influxdb:2.7.12-alpine
     container_name: iot-influxdb
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
@@ -62,7 +62,7 @@ services:
           memory: 512M
 
   telegraf:
-    image: telegraf:alpine
+    image: telegraf:1.39.0-alpine
     container_name: iot-telegraf
     environment:
       INFLUXDB_TOKEN: "${INFLUXDB_TOKEN}"
@@ -84,7 +84,7 @@ services:
           memory: 128M
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.0.2
     container_name: iot-grafana
     ports:
       - "${GRAFANA_PORT}:3000"
