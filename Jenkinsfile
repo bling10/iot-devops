@@ -1,85 +1,143 @@
-pipeline {
-    agent {
-        docker {
-            image 'espressif/idf:release-v5.5'
-            args '-u root -v /data/devops/artifacts/firmware:/opt/firmware-artifacts'
-        }
+def sendDingTalk(String title, String message) {
+    withCredentials([string(credentialsId: 'dingtalk-robot-token', variable: 'DINGTALK_TOKEN')]) {
+        sh "./ci/notify-dingtalk.sh '${title}' '${message}'"
     }
-    
+}
+
+pipeline {
+    agent none
+
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+        preserveStashes(buildCount: 5)
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '10'))
+    }
+
     environment {
-        PROJECT_DIR = "${WORKSPACE}/firmware/esp32-node"
         VERSION = "v1.0.${BUILD_NUMBER}"
-        OTA_SERVER_HOST = "192.168.249.60"
-        MQTT_HOST = "192.168.249.60"
+        PROJECT_DIR = 'firmware/esp32-node'
+        DIST_DIR = "dist/v1.0.${BUILD_NUMBER}"
+        OTA_SERVER_HOST = '192.168.100.60'
     }
 
     stages {
-        stage('Build Firmware') {
+        stage('Build and Verify Firmware') {
+            agent {
+                docker {
+                    image 'espressif/idf:release-v5.5'
+                    args '-u root'
+                    reuseNode true
+                }
+            }
             steps {
-                echo 'Building firmware using ESP-IDF...'
-                sh '''
-                    . $IDF_PATH/export.sh
-                    cd ${PROJECT_DIR}
-                    # 将固件版本号同步为 Jenkins 构建版本（用于 OTA 版本比对）
-                    sed -i "s/#define FIRMWARE_VERSION.*/#define FIRMWARE_VERSION   \\"${VERSION}\\"/" main/main.c
-                    echo "📦 固件版本已同步为: ${VERSION}"
-                    rm -rf build/
-                    idf.py set-target esp32
-                    idf.py build
-                '''
+                deleteDir()
+                checkout scm
+
+                script {
+                    env.GIT_SHA = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+                    env.GIT_SHA_SHORT = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
+                }
+
+                sh './ci/check-source.sh'
+                sh './ci/build-firmware.sh "$PROJECT_DIR" "$VERSION"'
+                sh './ci/verify-firmware.sh "$PROJECT_DIR" "$DIST_DIR" "$VERSION" "$GIT_SHA" "$BUILD_NUMBER" "$OTA_SERVER_HOST"'
+
+                script {
+                    env.FIRMWARE_SHA256 = sh(
+                        returnStdout: true,
+                        script: 'cut -d " " -f 1 "$DIST_DIR/firmware.sha256"'
+                    ).trim()
+                }
+
+                archiveArtifacts artifacts: "${env.DIST_DIR}/**", fingerprint: true
+                stash name: 'verified-firmware', includes: "${env.DIST_DIR}/**,ci/release-firmware.sh,ci/notify-dingtalk.sh"
+                milestone ordinal: 10
+            }
+            post {
+                success {
+                    script {
+                        try {
+                            sendDingTalk(
+                                'ESP32 固件待审批',
+                                "版本: ${env.VERSION}<br>Commit: ${env.GIT_SHA_SHORT}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>审批地址: ${env.BUILD_URL}input/"
+                            )
+                        } catch (err) {
+                            echo "钉钉待审批通知发送失败，但固件仍保留在 Jenkins 归档中: ${err.message}"
+                        }
+                    }
+                }
             }
         }
-        
-        stage('Deploy to Nginx') {
+
+        stage('Approve OTA Release') {
+            agent none
+            options {
+                timeout(time: 24, unit: 'HOURS')
+            }
+            input {
+                message '是否发布已验证的 ESP32 固件？请先检查本次构建归档中的 manifest.json、检查报告和 SHA-256。'
+                ok '批准 OTA 发布'
+                submitter 'ota-release-approver,root'
+                submitterParameter 'APPROVED_BY'
+            }
             steps {
-                echo 'Copying firmware.bin to Nginx server...'
-                sh '''
-                    cp ${PROJECT_DIR}/build/sample_project.bin /opt/firmware-artifacts/firmware_${VERSION}.bin
-                    echo "MD5 Checksum:"
-                    md5sum /opt/firmware-artifacts/firmware_${VERSION}.bin
-                '''
+                echo "OTA release approved by ${env.APPROVED_BY}"
+                milestone ordinal: 20
             }
         }
-        
-        stage('MQTT Notification') {
+
+        stage('Release OTA') {
+            agent any
             steps {
-                echo 'Triggering OTA via MQTT...'
-                sh '''
-                    FIRMWARE_MD5=$(md5sum /opt/firmware-artifacts/firmware_${VERSION}.bin | awk '{print $1}')
-                    cat <<EOF > ota_notify.json
-{
-  "version": "${VERSION}",
-  "url": "http://${OTA_SERVER_HOST}:8081/firmware_${VERSION}.bin",
-  "md5": "${FIRMWARE_MD5}"
-}
-EOF
-                    # Install Mosquitto clients if not already present
-                    if ! command -v mosquitto_pub &> /dev/null; then
-                        apt-get update && apt-get install -y mosquitto-clients
-                    fi
-                    
-                    # Publish MQTT message
-                    mosquitto_pub -h ${MQTT_HOST} -p 1883 -t "device/esp32/ota" -f ota_notify.json
-                '''
+                deleteDir()
+                unstash 'verified-firmware'
+                sh './ci/release-firmware.sh "$DIST_DIR" "$VERSION"'
+
+                script {
+                    try {
+                        sendDingTalk(
+                            'ESP32 OTA 指令已发布',
+                            "版本: ${env.VERSION}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>状态: 固件已发布并下发 OTA 指令，设备最终结果仍待回执。<br>构建地址: ${env.BUILD_URL}"
+                        )
+                    } catch (err) {
+                        echo "钉钉发布通知发送失败: ${err.message}"
+                    }
+                }
             }
         }
     }
+
     post {
-        success {
-            echo '✅ Pipeline execution successful, sending DingTalk notification...'
-            sh """
-                curl -H 'Content-Type: application/json' \\
-                     -d '{"msgtype": "markdown", "markdown": {"title":"🚀 OTA 固件发布成功", "text":"### 🚀 ESP32 OTA 固件发布成功\\n\\n**版本号:** `${VERSION}`\\n\\n**状态:** ✅ 构建与推送完成\\n\\n设备即将开始自动拉取升级。"}}' \\
-                     https://oapi.dingtalk.com/robot/send?access_token=b81864f4a2086e542dca30e11216c5a2c7f46c9d8489c816dfa136b0b3934318
-            """
-        }
         failure {
-            echo '❌ Pipeline execution failed, sending DingTalk alert...'
-            sh """
-                curl -H 'Content-Type: application/json' \\
-                     -d '{"msgtype": "markdown", "markdown": {"title":"💥 固件构建失败", "text":"### 💥 ESP32 固件构建失败\\n\\n**版本号:** `${VERSION}`\\n\\n**状态:** ❌ 编译不通过或环境异常\\n\\n请开发人员立即检查 Jenkins 日志！"}}' \\
-                     https://oapi.dingtalk.com/robot/send?access_token=b81864f4a2086e542dca30e11216c5a2c7f46c9d8489c816dfa136b0b3934318
-            """
+            script {
+                node {
+                    try {
+                        checkout scm
+                        sendDingTalk(
+                            'ESP32 固件流水线失败',
+                            "版本: ${env.VERSION}<br>状态: 构建、校验或发布阶段失败。<br>日志: ${env.BUILD_URL}console"
+                        )
+                    } catch (err) {
+                        echo "钉钉失败通知发送失败: ${err.message}"
+                    }
+                }
+            }
+        }
+        aborted {
+            script {
+                node {
+                    try {
+                        checkout scm
+                        sendDingTalk(
+                            'ESP32 OTA 发布已取消',
+                            "版本: ${env.VERSION}<br>状态: 审批被拒绝、超时或旧构建已失效，未发布 OTA。<br>构建地址: ${env.BUILD_URL}"
+                        )
+                    } catch (err) {
+                        echo "钉钉取消通知发送失败: ${err.message}"
+                    }
+                }
+            }
         }
     }
 }

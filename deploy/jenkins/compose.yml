@@ -7,9 +7,13 @@ services:
       - "${JENKINS_AGENT_PORT}:50000"
     volumes:
       - "${RUNTIME_ROOT}/jenkins/home:/var/jenkins_home"
+      - "${ARTIFACT_ROOT}/firmware:/opt/firmware-artifacts"
+      - "${PROJECT_ROOT}/deploy/jenkins/init.groovy.d/ensure-dingtalk-credential.groovy:/var/jenkins_home/init.groovy.d/ensure-dingtalk-credential.groovy:ro"
       - /usr/bin/docker:/usr/bin/docker
       - /var/run/docker.sock:/var/run/docker.sock
       - /etc/docker/daemon.json:/etc/docker/daemon.json:ro
+    secrets:
+      - dingtalk_token
     restart: unless-stopped
     networks:
       - jenkins-net
@@ -22,3 +26,7 @@ services:
 networks:
   jenkins-net:
     driver: bridge
+
+secrets:
+  dingtalk_token:
+    file: "${DINGTALK_TOKEN_FILE}"

@@ -29,7 +29,6 @@ void mqtt_app_start(void);      // 前置声明
 #define MQTT_BROKER        "mqtt://192.168.249.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
 #define MQTT_TOPIC         "telemetry/sensors"
 #define OTA_TOPIC          "device/esp32/ota"      // OTA 升级通知订阅主题
-#define FIRMWARE_VERSION   "v1.0.0"                // 固件版本号（Jenkins 编译时会自动替换）
 #define OTA_BUF_SIZE       1024                    // OTA 下载缓冲区大小
 
 static const char *TAG = "IOT_NODE";
@@ -39,6 +38,12 @@ esp_mqtt_client_handle_t mqtt_client = NULL;
 static volatile bool is_mqtt_connected = false; // 🟢 【修复】volatile 保证多任务/中断间可见性
 static volatile bool is_ota_in_progress = false; // 🔒 OTA 进行中标志，防止重复触发
 static char ota_url[256] = {0};                   // 缓存 OTA 固件下载地址
+
+static const char *get_firmware_version(void)
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    return app_desc != NULL ? app_desc->version : "unknown";
+}
 
 // ⏱️ 防变砖看门狗定时器
 TimerHandle_t rollback_timer = NULL;
@@ -224,9 +229,11 @@ static void ota_task(void *pvParameters)
  * 
  * 预期 JSON 格式（由 Jenkins 流水线生成）：
  * {
+ *   "release_id": "jenkins-36-abc123def456",
  *   "version": "v1.0.12",
  *   "url": "http://192.168.249.60:8081/firmware_v1.0.12.bin",
- *   "md5": "d41d8cd98f00b204e9800998ecf8427e"
+ *   "artifact_size": 927104,
+ *   "sha256": "example-sha256"
  * }
  */
 static void handle_ota_message(const char *data, int data_len)
@@ -269,12 +276,13 @@ static void handle_ota_message(const char *data, int data_len)
 
     ESP_LOGI(TAG, "📋 收到 OTA 升级通知:");
     ESP_LOGI(TAG, "   远端版本: %s", new_version);
-    ESP_LOGI(TAG, "   当前版本: %s", FIRMWARE_VERSION);
+    const char *current_version = get_firmware_version();
+    ESP_LOGI(TAG, "   当前版本: %s", current_version);
     ESP_LOGI(TAG, "   固件地址: %s", new_url);
 
     // 版本比对：如果版本号相同则跳过
-    if (strcmp(new_version, FIRMWARE_VERSION) == 0) {
-        ESP_LOGW(TAG, "⚠️ 远端版本与当前版本一致 (%s)，跳过升级", FIRMWARE_VERSION);
+    if (strcmp(new_version, current_version) == 0) {
+        ESP_LOGW(TAG, "⚠️ 远端版本与当前版本一致 (%s)，跳过升级", current_version);
         cJSON_Delete(root);
         return;
     }
@@ -416,7 +424,7 @@ void vTaskSensor(void *pvParameters) {
 
             snprintf(payload, sizeof(payload), 
                 "{\"temperature\": %.2f, \"humidity\": %.2f, \"rssi\": %d, \"free_heap\": %lu, \"uptime_sec\": %lu, \"version\": \"%s\"}", 
-                mock_temp, mock_hum, rssi, free_heap, uptime_sec, FIRMWARE_VERSION);
+                mock_temp, mock_hum, rssi, free_heap, uptime_sec, get_firmware_version());
             
             int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
             if (msg_id < 0) {
@@ -438,7 +446,7 @@ void vTaskSensor(void *pvParameters) {
 void app_main(void) {
     ESP_LOGI(TAG, "=========================================");
     ESP_LOGI(TAG, "🚀 嵌入式 IoT 终端启动 | OTA 空中升级已就绪");
-    ESP_LOGI(TAG, "📦 当前固件版本: %s", FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "📦 当前固件版本: %s", get_firmware_version());
 
     // 打印当前运行的 OTA 分区信息
     const esp_partition_t *running = esp_ota_get_running_partition();
