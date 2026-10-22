@@ -1,0 +1,1 @@
+{"date":"2026-10-22","goal":"将源码检测与固件检测工具选择同步到 README","completed":["更新组件表和预期流水线","细化源码质量门禁及实施状态","细化固件质量门禁及能力边界","更新实施顺序和参考链接"],"decision":"Cppcheck 负责源码扫描，Warnings NG 负责报告展示，固件由 esptool、ESP-IDF 容量报告和 SHA-256 联合校验","remaining":["实施并验证 Cppcheck 与 Warnings NG","复验真实 Jenkins 审批流程和真实设备 OTA/回滚"],"verification":"git diff --check passed"}

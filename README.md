@@ -50,7 +50,7 @@ flowchart LR
 
 1. 开发者向 GitLab 推送 ESP32 源码。
 2. GitLab Webhook 触发 Jenkins 声明式流水线。
-3. Jenkins 先执行格式、静态分析、测试和敏感信息检查，再在固定 ESP-IDF 容器中交叉编译。
+3. 目标流程中，Jenkins 先执行基础工程检查、格式检查、Cppcheck 静态分析、测试和敏感信息检查，再在固定 ESP-IDF 容器中交叉编译。
 4. 流水线使用 Jenkins 构建号生成固件版本，并校验镜像格式、目标芯片、内部版本、分区容量和 SHA-256。
 5. 验证通过的固件与发布清单先进入暂存区并归档，钉钉发送待审批通知。
 6. 维护者在 Jenkins 查看构建报告并批准或拒绝；只有 `master` 或正式版本标签允许进入发布阶段。
@@ -59,7 +59,7 @@ flowchart LR
 9. ESP32 比较版本、下载并校验固件、写入备用 OTA 分区并重启。
 10. 新固件完成版本和业务健康检查后标记为有效；失败时回滚并上报最终结果。
 
-上述步骤是目标流程。当前实现仍是构建后直接复制固件并发布 MQTT，质量门禁、人工审批、SHA-256 设备端校验和后端状态闭环尚待实现。
+上述步骤是目标流程。当前仓库中的新版 Jenkinsfile 已实现构建侧固件门禁、归档、人工审批和审批后 SHA-256 复核，但服务器 Jenkins Job 尚未读取该版本并完成真实流程复验；Cppcheck 源码分析、SHA-256 设备端校验和后端状态闭环仍待实现。
 
 ### 遥测监控链路
 
@@ -115,10 +115,12 @@ flowchart LR
 | 可视化 | Grafana | 已启用 | 设备与服务端监控面板 |
 | 通知 | 钉钉机器人 | 已接入 | Jenkins 构建成功或失败通知 |
 | 发布协调 | 轻量后端及持久化状态库 | 规划中，尚无代码 | 发布任务登记、设备期望版本、回执归集、超时判定与结果查询 |
-| 代码质量 | SonarQube 9.9 Community | 已部署，待接入 | 计划用于流水线质量检查；C 代码分析方案仍需确认 |
+| 源码静态分析 | Cppcheck | 规划中，待接入 | 作为 ESP-IDF/C 源码的主静态分析工具，检测空指针、数组越界、未初始化变量、资源泄漏和可疑逻辑 |
+| 质量报告 | Jenkins Warnings NG | 规划中，待接入 | 汇总 Cppcheck 与编译器告警，展示文件、行号、严重度和变化趋势，并执行新增问题门禁 |
+| 代码质量平台 | SonarQube 9.9 Community | 已部署，暂不作为主门禁 | Community 版本不直接提供官方 C/C++ 分析；仅在后续确有独立质量平台需求时评估导入外部报告 |
 | 镜像仓库 | Harbor | 暂停使用 | 原计划管理容器镜像，因业务调整未进入当前链路 |
 
-> SonarQube Community 版本对 ESP-IDF C 项目的分析能力有限。后续优先接入 `clang-format`、`clang-tidy` 或 `cppcheck`，再根据实际能力决定是否将结果汇总到 SonarQube。
+> 当前选型将“检测引擎”和“报告界面”分开：Cppcheck 负责源码静态分析，Jenkins Warnings NG 负责报告展示与质量门禁。ESP-IDF/GCC 编译告警作为补充，ESP-IDF Clang-Tidy 作为后续增强。SonarQube 暂不进入核心链路，避免只为展示报告而增加一套需要维护的服务。
 
 ## 当前已实现能力
 
@@ -377,7 +379,7 @@ cd /data/devops/iot-devops
 ```text
 代码提交
    ↓
-源代码检查
+基础工程检查 + Cppcheck 源码静态分析
    ├─ 失败 → 停止流水线并发送通知
    └─ 通过
         ↓
@@ -385,7 +387,7 @@ ESP-IDF 编译
    ├─ 失败 → 停止流水线并发送通知
    └─ 成功
         ↓
-固件检查 + 生成发布清单
+esptool 镜像检查 + 容量检查 + SHA-256 + 发布清单
    ├─ 失败 → 停止流水线并发送通知
    └─ 通过
         ↓
@@ -432,11 +434,17 @@ Jenkins 人工审批
 | 基础仓库检查 | 检查冲突标记、空白错误、异常大文件和构建目录误提交 | 失败即阻断 |
 | 代码格式 | 使用仓库内统一的 `.clang-format` 检查 C/C++ 文件 | 失败即阻断 |
 | 敏感信息 | 检查密码、Token、私钥及不应提交的环境配置 | 失败即阻断 |
-| 静态分析 | 采用 ESP-IDF Clang 检查或适合项目代码的静态分析工具 | 先形成基线，新增高严重度问题再阻断 |
+| 静态分析 | 使用 Cppcheck 分析 ESP-IDF/C 源码并输出 XML 报告 | 先形成基线；`error` 和新增高严重度问题阻断 |
+| 编译器诊断 | 收集 ESP-IDF/GCC 构建期间的 warning 和 error | error 直接阻断；warning 先统计再逐步收紧 |
+| 报告展示 | Jenkins Warnings NG 汇总 Cppcheck 和编译器报告 | 保留构建趋势，并对新增问题执行门禁 |
 | 单元测试 | 覆盖版本比较、OTA 消息解析、状态转换和后端核心逻辑 | 失败即阻断 |
 | 配置检查 | 检查目标芯片、OTA 分区、回滚配置和必要构建参数 | 失败即阻断 |
 
-静态分析初次接入不追求立即清零所有历史告警，应先确认真实问题与误报，再逐步收紧门禁。硬件相关测试单独放入真实板验证阶段，不能用设备模拟器代替 Flash 和 Bootloader 行为验证。
+源码检测的主工具确定为 **Cppcheck**，现有 `ci/check-source.sh` 继续负责仓库文件、OTA 分区和回滚配置等基础工程检查。Cppcheck 负责发现空指针、数组越界、未初始化变量、资源泄漏和可疑控制流等源码问题；Jenkins Warnings NG 只负责解析报告、展示文件与行号、统计新增/修复问题并执行质量门禁，不重复承担扫描工作。
+
+静态分析初次接入不追求立即清零所有历史告警，应先确认真实问题与误报，再逐步收紧门禁。ESP-IDF Clang-Tidy 对实际编译参数和宏的理解更深入，但其工具链和接入成本更高，作为 Cppcheck 稳定运行后的增强项。SonarQube Community 不作为 ESP-IDF/C 的主检测器；如后续论文展示确实需要独立质量平台，只导入已经生成的检测报告，不让它成为新的必需构建依赖。
+
+当前实施状态：`ci/check-source.sh` 的基础工程检查已经存在；Cppcheck 扫描、XML 报告、Warnings NG 展示及告警基线尚未接入，因此在完成真实 Jenkins 构建验证前不得写成“源码静态分析已完成”。硬件相关测试单独放入真实板验证阶段，不能用设备模拟器代替 Flash 和 Bootloader 行为验证。
 
 ### 固件质量门禁
 
@@ -448,6 +456,19 @@ Jenkins 人工审批
 - 生成 SHA-256，并保存固件大小、构建号、Git Commit 和检查结果。
 - 归档应用 BIN、ELF、MAP、分区表及必要构建报告，便于问题定位和论文实验复现。
 - 生成 `manifest.json` 发布清单，至少包含 `release_id`、版本、构建号、Commit、目标芯片、文件大小、下载地址、SHA-256 和各项门禁结果。
+
+固件检测不使用 Cppcheck 或 SonarQube，而是由 `ci/verify-firmware.sh` 串联 ESP-IDF 官方构建工具和通用摘要工具：
+
+| 工具或步骤 | 主要职责 | 当前状态 |
+| --- | --- | --- |
+| `esptool image_info` | 解析 ESP32 应用镜像，核对镜像结构、项目名、目标芯片和内部版本 | 已实现并完成隔离构建验证 |
+| `idf.py size`、`idf.py size-components` | 输出总体和组件容量报告，辅助定位固件体积增长 | 已实现并归档报告 |
+| OTA 分区容量检查 | 将应用 BIN 大小与 `ota_0` 分区上限比较，超过上限阻断，达到 90% 给出预警 | 已实现 |
+| `sha256sum` | 构建后生成固件摘要，审批后发布前再次计算并与归档摘要比较 | 已实现；真实 Jenkins 审批流程待复验 |
+| `manifest.json` | 记录 `release_id`、版本、构建号、Commit、芯片、大小、下载地址和 SHA-256 | 已实现 |
+| 真实 ESP32 启动与回滚验证 | 证明固件能够写入 OTA 分区、重启、通过健康检查或由 Bootloader 回滚 | 待形成可复查的真实板实验记录 |
+
+这套门禁证明的是固件“格式可解析、版本可追溯、容量可容纳、内容未被替换”，不能单独证明固件一定能在真实 ESP32 上正常启动。设备模拟器只验证 MQTT、后端状态流转和通知链路；最终启动成功与回滚仍以真实设备的串口日志、运行版本和健康回执为证据。
 
 MD5 可以保留用于兼容现有消息，但不能继续作为主要制品标识。设备下载完成后也必须计算并比对 SHA-256；服务器只计算摘要并不能证明设备收到的是同一文件。若后续需要证明固件来源可信，还应增加 TLS 或固件签名，因为普通哈希只能检测内容是否一致，不能完成发布者身份认证。
 
@@ -463,10 +484,10 @@ MD5 可以保留用于兼容现有消息，但不能继续作为主要制品标�
 
 ### 建议实施顺序
 
-1. 增加 Jenkins 人工审批，将固件正式复制和 MQTT 发布移动到审批之后。
-2. 增加固件格式、目标芯片、内部版本、容量和 SHA-256 检查，形成发布清单。
-3. 增加代码格式、敏感信息、静态分析和单元测试门禁。
-4. 改用 ESP-IDF 项目版本机制，迁移 Jenkinsfile 中的 Token、密码和其他凭据。
+1. 接入 Cppcheck，生成 XML 报告并建立首份经过人工确认的告警基线。
+2. 安装固定版本的 Jenkins Warnings NG，展示 Cppcheck 与编译器告警，先对 `error` 和新增高严重度问题执行阻断。
+3. 增加代码格式、敏感信息和单元测试门禁；Cppcheck 稳定后再评估 ESP-IDF Clang-Tidy。
+4. 将已经实现的人工审批、固件校验、SHA-256 复核和不可变制品发布放入真实 Jenkins Job 复验。
 5. 修正钉钉通知语义，并接入后端发布记录与设备最终结果。
 6. 最后增加分组灰度、TLS、固件签名及更完整的安全策略。
 
@@ -482,6 +503,9 @@ MD5 可以保留用于兼容现有消息，但不能继续作为主要制品标�
 
 ## 参考文档
 
+- [Cppcheck 官方手册](https://cppcheck.sourceforge.io/manual.html)
+- [Jenkins Warnings NG 插件](https://plugins.jenkins.io/warnings-ng/)
+- [SonarQube 支持语言说明](https://docs.sonarsource.com/sonarqube-community-build/analyzing-source-code/languages/overview)
 - [ESP-IDF OTA 与回滚](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/system/ota.html)
 - [ESP-IDF Wi-Fi Provisioning](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/provisioning/wifi_provisioning.html)
 - [ESP32 Secure Boot v2](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/security/secure-boot-v2.html)
