@@ -1,16 +1,21 @@
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <inttypes.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/timers.h"
+#include "freertos/event_groups.h"
 
 #include "esp_log.h"
 #include "mqtt_client.h"
@@ -19,25 +24,64 @@
 #include "esp_http_client.h"    // HTTP 客户端：从 Nginx 下载固件
 #include "esp_app_desc.h"       // 读取当前固件版本描述
 #include "cJSON.h"              // 解析 Jenkins 推送的 OTA JSON 消息
+#include "mbedtls/sha256.h"     // 下载过程中计算固件 SHA-256
 
 void mqtt_app_start(void);      // 前置声明
 
 // ================= 1. 核心参数配置区 =================
-// ⚠️ 测试阶段硬编码凭据，正式发布时应迁移至 menuconfig (Kconfig) 或 NVS 分区
-#define WIFI_SSID          "wifi"                  // ⚠️ 确保是 2.4GHz 频段的热点
-#define WIFI_PASS          "888888889999"          // ⚠️ WiFi 密码
-#define MQTT_BROKER        "mqtt://192.168.249.60" // ⚠️ 虚拟机 IP（确保桥接模式，两端互通）
+// 测试阶段硬编码凭据，正式发布时应迁移至 menuconfig (Kconfig) 或 NVS 分区
+#define WIFI_SSID          "wifi"                  // 确保是 2.4GHz 频段的热点
+#define WIFI_PASS          "888888889999"          // WiFi 密码
+#define MQTT_BROKER        "mqtt://192.168.249.60" // 虚拟机 IP（确保桥接模式，两端互通）
+#define DEVICE_ID          "esp32"
 #define MQTT_TOPIC         "telemetry/sensors"
 #define OTA_TOPIC          "device/esp32/ota"      // OTA 升级通知订阅主题
+#define OTA_STATUS_TOPIC   "device/esp32/status"   // OTA 阶段与最终结果回执主题
 #define OTA_BUF_SIZE       1024                    // OTA 下载缓冲区大小
+#define OTA_MESSAGE_MAX_LEN 2048
+#define OTA_HEALTH_TIMEOUT_MS 180000
+#define OTA_RELEASE_ID_MAX_LEN 96
+#define OTA_VERSION_MAX_LEN 32
+#define OTA_URL_MAX_LEN    256
+#define OTA_SHA256_HEX_LEN 64
+
+#define HEALTH_SENSOR_STARTED_BIT BIT0
+#define HEALTH_MQTT_CONNECTED_BIT BIT1
+#define HEALTH_OTA_SUBSCRIBED_BIT BIT2
+#define HEALTH_TELEMETRY_ACK_BIT BIT3
+#define HEALTH_REQUIRED_BITS (HEALTH_SENSOR_STARTED_BIT | HEALTH_MQTT_CONNECTED_BIT | \
+                              HEALTH_OTA_SUBSCRIBED_BIT | HEALTH_TELEMETRY_ACK_BIT)
+
+#define OTA_NVS_NAMESPACE  "ota_state"
+#define OTA_NVS_RELEASE_ID "release_id"
+#define OTA_NVS_VERSION    "version"
+
+typedef struct {
+    char release_id[OTA_RELEASE_ID_MAX_LEN];
+    char version[OTA_VERSION_MAX_LEN];
+    char url[OTA_URL_MAX_LEN];
+    size_t artifact_size;
+    char sha256[OTA_SHA256_HEX_LEN + 1];
+} ota_request_t;
+
+typedef enum {
+    OTA_BOOT_REPORT_NONE = 0,
+    OTA_BOOT_REPORT_HEALTHY,
+    OTA_BOOT_REPORT_ROLLED_BACK,
+} ota_boot_report_t;
 
 static const char *TAG = "IOT_NODE";
 
 // 全局句柄与真实连接状态位
 esp_mqtt_client_handle_t mqtt_client = NULL;
-static volatile bool is_mqtt_connected = false; // 🟢 【修复】volatile 保证多任务/中断间可见性
-static volatile bool is_ota_in_progress = false; // 🔒 OTA 进行中标志，防止重复触发
-static char ota_url[256] = {0};                   // 缓存 OTA 固件下载地址
+static volatile bool is_mqtt_connected = false; // 【修复】volatile 保证多任务/中断间可见性
+static volatile bool is_ota_in_progress = false; // OTA 进行中标志，防止重复触发
+static volatile bool is_pending_verify = false;
+static EventGroupHandle_t health_event_group = NULL;
+static int ota_subscribe_msg_id = -1;
+static int health_telemetry_msg_id = -1;
+static ota_request_t boot_ota_request = {0};
+static ota_boot_report_t boot_report_pending = OTA_BOOT_REPORT_NONE;
 
 static const char *get_firmware_version(void)
 {
@@ -45,11 +89,161 @@ static const char *get_firmware_version(void)
     return app_desc != NULL ? app_desc->version : "unknown";
 }
 
-// ⏱️ 防变砖看门狗定时器
-TimerHandle_t rollback_timer = NULL;
+static const char *ota_result_for_stage(const char *stage)
+{
+    if (strcmp(stage, "healthy") == 0) {
+        return "success";
+    }
+    if (strcmp(stage, "failed") == 0 || strcmp(stage, "rolled_back") == 0) {
+        return "failed";
+    }
+    if (strcmp(stage, "skipped") == 0) {
+        return "skipped";
+    }
+    return "in_progress";
+}
 
-static void rollback_timer_cb(TimerHandle_t xTimer) {
-    ESP_LOGE(TAG, "💀 新固件 3 分钟内未能连上 MQTT，判定为死锁/断网！触发 App Rollback 强制回退！");
+static bool publish_ota_status(const ota_request_t *request, const char *stage, const char *reason)
+{
+    if (!is_mqtt_connected || mqtt_client == NULL || request == NULL) {
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        ESP_LOGE(TAG, "无法创建 OTA 状态回执");
+        return false;
+    }
+
+    cJSON_AddStringToObject(root, "release_id", request->release_id);
+    cJSON_AddStringToObject(root, "device_id", DEVICE_ID);
+    cJSON_AddStringToObject(root, "stage", stage);
+    cJSON_AddStringToObject(root, "result", ota_result_for_stage(stage));
+    cJSON_AddStringToObject(root, "reported_version", get_firmware_version());
+    cJSON_AddStringToObject(root, "target_version", request->version);
+    if (request->artifact_size > 0) {
+        cJSON_AddNumberToObject(root, "artifact_size", (double)request->artifact_size);
+    }
+    cJSON_AddNumberToObject(root, "uptime_sec", (double)(esp_timer_get_time() / 1000000));
+    if (reason != NULL && reason[0] != '\0') {
+        cJSON_AddStringToObject(root, "reason", reason);
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (payload == NULL) {
+        ESP_LOGE(TAG, "无法序列化 OTA 状态回执");
+        return false;
+    }
+
+    int msg_id = esp_mqtt_client_publish(mqtt_client, OTA_STATUS_TOPIC, payload, 0, 1, 0);
+    cJSON_free(payload);
+    if (msg_id < 0) {
+        ESP_LOGE(TAG, "OTA 状态回执发送失败: %s", stage);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "OTA 状态已提交: %s", stage);
+    return true;
+}
+
+static esp_err_t save_ota_boot_context(const ota_request_t *request)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(handle, OTA_NVS_RELEASE_ID, request->release_id);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, OTA_NVS_VERSION, request->version);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static bool load_ota_boot_context(ota_request_t *request)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    size_t release_id_len = sizeof(request->release_id);
+    size_t version_len = sizeof(request->version);
+    err = nvs_get_str(handle, OTA_NVS_RELEASE_ID, request->release_id, &release_id_len);
+    if (err == ESP_OK) {
+        err = nvs_get_str(handle, OTA_NVS_VERSION, request->version, &version_len);
+    }
+    nvs_close(handle);
+    return err == ESP_OK;
+}
+
+static void clear_ota_boot_context(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "无法打开 OTA 状态存储: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_erase_all(handle);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "无法清理 OTA 状态存储: %s", esp_err_to_name(err));
+    }
+}
+
+static void try_publish_boot_result(void)
+{
+    if (boot_report_pending == OTA_BOOT_REPORT_NONE) {
+        return;
+    }
+
+    const char *state = boot_report_pending == OTA_BOOT_REPORT_HEALTHY ? "healthy" : "rolled_back";
+    if (publish_ota_status(&boot_ota_request, state, NULL)) {
+        clear_ota_boot_context();
+        boot_report_pending = OTA_BOOT_REPORT_NONE;
+    }
+}
+
+static void ota_health_task(void *pvParameters)
+{
+    EventBits_t bits = xEventGroupWaitBits(
+        health_event_group,
+        HEALTH_REQUIRED_BITS,
+        pdFALSE,
+        pdTRUE,
+        pdMS_TO_TICKS(OTA_HEALTH_TIMEOUT_MS)
+    );
+
+    if ((bits & HEALTH_REQUIRED_BITS) == HEALTH_REQUIRED_BITS) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            is_pending_verify = false;
+            boot_report_pending = OTA_BOOT_REPORT_HEALTHY;
+            ESP_LOGI(TAG, "新固件通过业务健康检查，已标记为 VALID");
+            try_publish_boot_result();
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGE(TAG, "无法确认新固件有效: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "新固件健康检查超时，已通过条件位: 0x%02x", (unsigned int)bits);
+    }
+
+    publish_ota_status(&boot_ota_request, "rollback", "health_check_failed");
+    esp_err_t rollback_err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    ESP_LOGE(TAG, "OTA 回滚失败: %s", esp_err_to_name(rollback_err));
     esp_restart();
 }
 
@@ -66,162 +260,224 @@ static void rollback_timer_cb(TimerHandle_t xTimer) {
  * 4. 写入完成后标记新分区为启动分区
  * 5. 自动重启，运行新固件
  */
+static void sha256_to_hex(const unsigned char digest[32], char output[OTA_SHA256_HEX_LEN + 1])
+{
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 32; i++) {
+        output[i * 2] = hex[digest[i] >> 4];
+        output[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    output[OTA_SHA256_HEX_LEN] = '\0';
+}
+
 static void ota_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "🚀 ========== OTA 升级任务启动 ==========");
-    ESP_LOGI(TAG, "📥 固件下载地址: %s", ota_url);
+    ota_request_t *request = pvParameters;
+    esp_http_client_handle_t client = NULL;
+    const esp_partition_t *update_partition = NULL;
+    esp_ota_handle_t ota_handle = 0;
+    mbedtls_sha256_context sha_context;
+    char *buffer = NULL;
+    const char *failure_reason = "unknown";
+    bool ota_started = false;
+    size_t total_read = 0;
+    int last_progress = -1;
 
-    esp_err_t err;
+    mbedtls_sha256_init(&sha_context);
+    ESP_LOGI(TAG, "========== OTA 升级任务启动 ==========");
+    ESP_LOGI(TAG, "release_id=%s | version=%s | size=%u",
+             request->release_id, request->version, (unsigned int)request->artifact_size);
+    publish_ota_status(request, "downloading", NULL);
 
-    // ---------- 1. 配置 HTTP 客户端 ----------
     esp_http_client_config_t http_config = {
-        .url = ota_url,
-        .timeout_ms = 30000,  // 30 秒超时，防止网络卡死
+        .url = request->url,
+        .timeout_ms = 30000,
     };
-    esp_http_client_handle_t client = esp_http_client_init(&http_config);
+    client = esp_http_client_init(&http_config);
     if (client == NULL) {
-        ESP_LOGE(TAG, "❌ HTTP 客户端初始化失败！");
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "HTTP 客户端初始化失败");
+        failure_reason = "http_init_failed";
+        goto cleanup;
     }
 
-    // ---------- 2. 打开 HTTP 连接 ----------
-    err = esp_http_client_open(client, 0);
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "❌ HTTP 连接失败: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "HTTP 连接失败: %s", esp_err_to_name(err));
+        failure_reason = "http_open_failed";
+        goto cleanup;
     }
 
     int content_length = esp_http_client_fetch_headers(client);
     int status_code = esp_http_client_get_status_code(client);
-    ESP_LOGI(TAG, "📊 HTTP 状态码: %d | 固件大小: %d 字节", status_code, content_length);
-
+    ESP_LOGI(TAG, "HTTP 状态码: %d | Content-Length: %d", status_code, content_length);
     if (status_code != 200) {
-        ESP_LOGE(TAG, "❌ HTTP 请求异常，状态码: %d", status_code);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "HTTP 请求异常，状态码: %d", status_code);
+        failure_reason = "http_status_invalid";
+        goto cleanup;
+    }
+    if (content_length > 0 && (size_t)content_length != request->artifact_size) {
+        ESP_LOGE(TAG, "HTTP 固件大小与发布清单不一致: %d != %u",
+                 content_length, (unsigned int)request->artifact_size);
+        failure_reason = "content_length_mismatch";
+        goto cleanup;
     }
 
-    // ---------- 3. 获取下一个可用的 OTA 分区 ----------
-    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    update_partition = esp_ota_get_next_update_partition(NULL);
     if (update_partition == NULL) {
-        ESP_LOGE(TAG, "❌ 找不到可用的 OTA 分区！请检查分区表配置");
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "找不到可用的 OTA 分区");
+        failure_reason = "ota_partition_missing";
+        goto cleanup;
     }
-    ESP_LOGI(TAG, "📦 目标 OTA 分区: %s (地址: 0x%08"PRIx32", 大小: %"PRIu32" 字节)",
+    if (request->artifact_size > update_partition->size) {
+        ESP_LOGE(TAG, "固件超过 OTA 分区容量: %u > %" PRIu32,
+                 (unsigned int)request->artifact_size, update_partition->size);
+        failure_reason = "firmware_too_large";
+        goto cleanup;
+    }
+    ESP_LOGI(TAG, "目标 OTA 分区: %s (地址: 0x%08" PRIx32 ", 大小: %" PRIu32 " 字节)",
              update_partition->label, update_partition->address, update_partition->size);
 
-    // ---------- 4. 开始 OTA 写入 ----------
-    esp_ota_handle_t ota_handle;
     err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "❌ OTA 写入初始化失败: %s", esp_err_to_name(err));
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "OTA 写入初始化失败: %s", esp_err_to_name(err));
+        failure_reason = "ota_begin_failed";
+        goto cleanup;
+    }
+    ota_started = true;
+
+    buffer = malloc(OTA_BUF_SIZE);
+    if (buffer == NULL) {
+        ESP_LOGE(TAG, "OTA 缓冲区分配失败");
+        failure_reason = "out_of_memory";
+        goto cleanup;
     }
 
-    // ---------- 5. 循环读取 HTTP 数据流并逐块写入 Flash ----------
-    char *buf = malloc(OTA_BUF_SIZE);
-    if (buf == NULL) {
-        ESP_LOGE(TAG, "❌ 内存分配失败！");
-        esp_ota_abort(ota_handle);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+    if (mbedtls_sha256_starts(&sha_context, 0) != 0) {
+        ESP_LOGE(TAG, "SHA-256 初始化失败");
+        failure_reason = "sha256_init_failed";
+        goto cleanup;
     }
-
-    int total_read = 0;
-    int read_len;
-    int last_progress = -1;
-
-    while (1) {
-        read_len = esp_http_client_read(client, buf, OTA_BUF_SIZE);
+    while (true) {
+        int read_len = esp_http_client_read(client, buffer, OTA_BUF_SIZE);
         if (read_len < 0) {
-            ESP_LOGE(TAG, "❌ HTTP 数据读取出错！");
-            break;
+            ESP_LOGE(TAG, "HTTP 数据读取失败");
+            failure_reason = "http_read_failed";
+            goto cleanup;
         }
         if (read_len == 0) {
-            // 数据读取完毕
-            if (esp_http_client_is_complete_data_received(client)) {
-                ESP_LOGI(TAG, "✅ 固件数据接收完毕！");
-            } else {
-                ESP_LOGE(TAG, "❌ 连接中断，数据不完整！");
+            bool http_complete = esp_http_client_is_complete_data_received(client);
+            if (!http_complete) {
+                ESP_LOGE(TAG, "HTTP 连接提前结束，固件数据不完整");
+                failure_reason = "http_data_incomplete";
+                goto cleanup;
             }
             break;
         }
 
-        // 写入 Flash
-        err = esp_ota_write(ota_handle, buf, read_len);
+        if (total_read + (size_t)read_len > request->artifact_size) {
+            ESP_LOGE(TAG, "下载数据超过发布清单中的固件大小");
+            failure_reason = "artifact_size_exceeded";
+            goto cleanup;
+        }
+
+        err = esp_ota_write(ota_handle, buffer, (size_t)read_len);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "❌ Flash 写入失败: %s", esp_err_to_name(err));
-            break;
+            ESP_LOGE(TAG, "Flash 写入失败: %s", esp_err_to_name(err));
+            failure_reason = "ota_write_failed";
+            goto cleanup;
+        }
+        if (mbedtls_sha256_update(&sha_context, (const unsigned char *)buffer, (size_t)read_len) != 0) {
+            ESP_LOGE(TAG, "SHA-256 计算失败");
+            failure_reason = "sha256_update_failed";
+            goto cleanup;
         }
 
-        total_read += read_len;
-
-        // 每 10% 打印一次进度
-        if (content_length > 0) {
-            int progress = (total_read * 100) / content_length;
-            if (progress / 10 != last_progress / 10) {
-                last_progress = progress;
-                ESP_LOGI(TAG, "⏳ OTA 下载进度: %d%% (%d/%d 字节)", progress, total_read, content_length);
-            }
+        total_read += (size_t)read_len;
+        int progress = (int)((total_read * 100U) / request->artifact_size);
+        if (progress / 10 != last_progress / 10) {
+            last_progress = progress;
+            ESP_LOGI(TAG, "OTA 下载进度: %d%% (%u/%u 字节)", progress,
+                     (unsigned int)total_read, (unsigned int)request->artifact_size);
         }
     }
 
-    free(buf);
+    if (total_read != request->artifact_size) {
+        ESP_LOGE(TAG, "实际下载大小与发布清单不一致: %u != %u",
+                 (unsigned int)total_read, (unsigned int)request->artifact_size);
+        failure_reason = "artifact_size_mismatch";
+        goto cleanup;
+    }
+
+    unsigned char digest[32];
+    if (mbedtls_sha256_finish(&sha_context, digest) != 0) {
+        ESP_LOGE(TAG, "SHA-256 计算收尾失败");
+        failure_reason = "sha256_finish_failed";
+        goto cleanup;
+    }
+    char actual_sha256[OTA_SHA256_HEX_LEN + 1];
+    sha256_to_hex(digest, actual_sha256);
+    if (strcmp(actual_sha256, request->sha256) != 0) {
+        ESP_LOGE(TAG, "固件 SHA-256 与发布清单不一致");
+        failure_reason = "sha256_mismatch";
+        goto cleanup;
+    }
+
+    free(buffer);
+    buffer = NULL;
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-
-    // ---------- 6. 完成 OTA 写入 ----------
-    if (err == ESP_OK && esp_http_client_is_complete_data_received(client) == false && total_read > 0) {
-        // 部分情况下 chunked encoding 不会设 content_length，但数据可能已完整
-        ESP_LOGW(TAG, "⚠️ 数据接收标志未置位，但已读取 %d 字节，继续尝试完成 OTA", total_read);
-    }
+    client = NULL;
 
     err = esp_ota_end(ota_handle);
+    ota_started = false;
     if (err != ESP_OK) {
-        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-            ESP_LOGE(TAG, "❌ 固件校验失败！镜像可能已损坏");
-        } else {
-            ESP_LOGE(TAG, "❌ OTA 结束失败: %s", esp_err_to_name(err));
-        }
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "OTA 镜像校验失败: %s", esp_err_to_name(err));
+        failure_reason = "ota_end_failed";
+        goto cleanup;
     }
 
-    // ---------- 7. 设置新分区为下次启动分区 ----------
+    err = save_ota_boot_context(request);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "无法保存 OTA 发布上下文: %s", esp_err_to_name(err));
+        failure_reason = "ota_context_save_failed";
+        goto cleanup;
+    }
+
     err = esp_ota_set_boot_partition(update_partition);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "❌ 设置启动分区失败: %s", esp_err_to_name(err));
-        is_ota_in_progress = false;
-        vTaskDelete(NULL);
-        return;
+        ESP_LOGE(TAG, "设置启动分区失败: %s", esp_err_to_name(err));
+        clear_ota_boot_context();
+        failure_reason = "set_boot_partition_failed";
+        goto cleanup;
     }
 
-    ESP_LOGI(TAG, "🎉 ========== OTA 升级成功！==========");
-    ESP_LOGI(TAG, "📦 新固件已写入分区: %s", update_partition->label);
-    ESP_LOGI(TAG, "🔄 3 秒后自动重启...");
-
+    publish_ota_status(request, "verified", NULL);
+    publish_ota_status(request, "rebooting", NULL);
+    ESP_LOGI(TAG, "OTA 下载、大小与 SHA-256 校验全部通过");
+    ESP_LOGI(TAG, "新固件已写入分区: %s，3 秒后重启", update_partition->label);
+    free(request);
+    mbedtls_sha256_free(&sha_context);
     vTaskDelay(pdMS_TO_TICKS(3000));
     esp_restart();
+    return;
+
+cleanup:
+    mbedtls_sha256_free(&sha_context);
+    if (ota_started) {
+        esp_ota_abort(ota_handle);
+    }
+    if (buffer != NULL) {
+        free(buffer);
+    }
+    if (client != NULL) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    publish_ota_status(request, "failed", failure_reason);
+    ESP_LOGE(TAG, "OTA 升级已中止: %s", failure_reason);
+    free(request);
+    is_ota_in_progress = false;
+    vTaskDelete(NULL);
 }
 
 /**
@@ -233,70 +489,127 @@ static void ota_task(void *pvParameters)
  *   "version": "v1.0.12",
  *   "url": "http://192.168.249.60:8081/firmware_v1.0.12.bin",
  *   "artifact_size": 927104,
- *   "sha256": "example-sha256"
+ *   "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
  * }
  */
+static bool copy_required_string(cJSON *root, const char *name, char *destination, size_t capacity)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        ESP_LOGE(TAG, "OTA JSON 缺少字符串字段: %s", name);
+        return false;
+    }
+
+    size_t length = strlen(item->valuestring);
+    if (length == 0 || length >= capacity) {
+        ESP_LOGE(TAG, "OTA JSON 字段长度非法: %s", name);
+        return false;
+    }
+
+    memcpy(destination, item->valuestring, length + 1);
+    return true;
+}
+
+static bool normalize_sha256(char sha256[OTA_SHA256_HEX_LEN + 1])
+{
+    if (strlen(sha256) != OTA_SHA256_HEX_LEN) {
+        return false;
+    }
+
+    for (size_t i = 0; i < OTA_SHA256_HEX_LEN; i++) {
+        unsigned char value = (unsigned char)sha256[i];
+        if (!isxdigit(value)) {
+            return false;
+        }
+        sha256[i] = (char)tolower(value);
+    }
+    return true;
+}
+
 static void handle_ota_message(const char *data, int data_len)
 {
-    // 防止重复触发
     if (is_ota_in_progress) {
-        ESP_LOGW(TAG, "⚠️ OTA 升级正在进行中，忽略重复通知");
+        ESP_LOGW(TAG, "OTA 升级正在进行中，忽略重复通知");
+        return;
+    }
+    if (data == NULL || data_len <= 0 || data_len > OTA_MESSAGE_MAX_LEN) {
+        ESP_LOGE(TAG, "OTA 消息长度非法: %d", data_len);
         return;
     }
 
-    // 安全拷贝 JSON 数据（确保以 \0 结尾）
-    char *json_str = malloc(data_len + 1);
+    char *json_str = malloc((size_t)data_len + 1U);
     if (json_str == NULL) {
-        ESP_LOGE(TAG, "❌ 内存分配失败，无法解析 OTA 消息");
+        ESP_LOGE(TAG, "内存分配失败，无法解析 OTA 消息");
         return;
     }
-    memcpy(json_str, data, data_len);
+    memcpy(json_str, data, (size_t)data_len);
     json_str[data_len] = '\0';
 
-    // 解析 JSON
     cJSON *root = cJSON_Parse(json_str);
     free(json_str);
-
     if (root == NULL) {
-        ESP_LOGE(TAG, "❌ OTA JSON 解析失败！");
+        ESP_LOGE(TAG, "OTA JSON 解析失败");
         return;
     }
 
-    cJSON *version_item = cJSON_GetObjectItem(root, "version");
-    cJSON *url_item = cJSON_GetObjectItem(root, "url");
-
-    if (!cJSON_IsString(version_item) || !cJSON_IsString(url_item)) {
-        ESP_LOGE(TAG, "❌ OTA JSON 格式错误：缺少 version 或 url 字段");
+    ota_request_t *request = calloc(1, sizeof(ota_request_t));
+    if (request == NULL) {
+        ESP_LOGE(TAG, "无法分配 OTA 请求上下文");
         cJSON_Delete(root);
         return;
     }
 
-    const char *new_version = version_item->valuestring;
-    const char *new_url = url_item->valuestring;
+    bool fields_valid =
+        copy_required_string(root, "release_id", request->release_id, sizeof(request->release_id)) &&
+        copy_required_string(root, "version", request->version, sizeof(request->version)) &&
+        copy_required_string(root, "url", request->url, sizeof(request->url)) &&
+        copy_required_string(root, "sha256", request->sha256, sizeof(request->sha256));
 
-    ESP_LOGI(TAG, "📋 收到 OTA 升级通知:");
-    ESP_LOGI(TAG, "   远端版本: %s", new_version);
+    cJSON *artifact_size_item = cJSON_GetObjectItemCaseSensitive(root, "artifact_size");
+    if (!cJSON_IsNumber(artifact_size_item) || artifact_size_item->valuedouble <= 0 ||
+        artifact_size_item->valuedouble > UINT32_MAX ||
+        artifact_size_item->valuedouble != (double)(size_t)artifact_size_item->valuedouble) {
+        ESP_LOGE(TAG, "OTA JSON 的 artifact_size 非法");
+        fields_valid = false;
+    } else {
+        request->artifact_size = (size_t)artifact_size_item->valuedouble;
+    }
+
+    cJSON_Delete(root);
+    if (!fields_valid || !normalize_sha256(request->sha256)) {
+        ESP_LOGE(TAG, "OTA 发布清单校验失败");
+        free(request);
+        return;
+    }
+    if (strncmp(request->url, "http://", 7) != 0 && strncmp(request->url, "https://", 8) != 0) {
+        ESP_LOGE(TAG, "OTA URL 必须使用 HTTP 或 HTTPS");
+        free(request);
+        return;
+    }
+
+    ESP_LOGI(TAG, "收到 OTA 升级通知:");
+    ESP_LOGI(TAG, "   release_id: %s", request->release_id);
+    ESP_LOGI(TAG, "   远端版本: %s", request->version);
     const char *current_version = get_firmware_version();
     ESP_LOGI(TAG, "   当前版本: %s", current_version);
-    ESP_LOGI(TAG, "   固件地址: %s", new_url);
+    ESP_LOGI(TAG, "   固件大小: %u", (unsigned int)request->artifact_size);
 
-    // 版本比对：如果版本号相同则跳过
-    if (strcmp(new_version, current_version) == 0) {
-        ESP_LOGW(TAG, "⚠️ 远端版本与当前版本一致 (%s)，跳过升级", current_version);
-        cJSON_Delete(root);
+    if (strcmp(request->version, current_version) == 0) {
+        ESP_LOGW(TAG, "远端版本与当前版本一致 (%s)，跳过升级", current_version);
+        publish_ota_status(request, "skipped", "version_unchanged");
+        free(request);
         return;
     }
 
-    // 保存 URL 并启动 OTA 任务
-    strncpy(ota_url, new_url, sizeof(ota_url) - 1);
-    ota_url[sizeof(ota_url) - 1] = '\0';
-
     is_ota_in_progress = true;
-    cJSON_Delete(root);
-
-    ESP_LOGI(TAG, "🔧 正在启动 OTA 下载任务...");
-    // 栈深度 8KB，OTA 任务优先级设为 5（高于传感器任务的 3）
-    xTaskCreate(ota_task, "OTA_Task", 8192, NULL, 5, NULL);
+    publish_ota_status(request, "received", NULL);
+    BaseType_t task_created = xTaskCreate(ota_task, "OTA_Task", 8192, request, 5, NULL);
+    if (task_created != pdPASS) {
+        ESP_LOGE(TAG, "OTA 任务创建失败");
+        publish_ota_status(request, "failed", "task_create_failed");
+        is_ota_in_progress = false;
+        free(request);
+    }
 }
 
 // ================= 3. 网络状态机事件回调 =================
@@ -306,16 +619,16 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "❌ WiFi 断开，尝试重连...");
+        ESP_LOGW(TAG, "WiFi 断开，尝试重连...");
         is_mqtt_connected = false; // WiFi 断开，MQTT 必然失效
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "🔹 WiFi 连接成功! 获取到本地 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi 连接成功! 获取到本地 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         
         // 【核心修改】确保获取到 IP 后才启动/恢复 MQTT
         if (mqtt_client == NULL) {
-            ESP_LOGI(TAG, "🚀 网络就绪，首次启动 MQTT 客户端...");
+            ESP_LOGI(TAG, "网络就绪，首次启动 MQTT 客户端...");
             mqtt_app_start();
         }
     }
@@ -326,33 +639,51 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     esp_mqtt_event_handle_t event = event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "🟢 MQTT 服务器连接成功！");
-            is_mqtt_connected = true;  // 🟢 【关键】联通后，业务解锁开闸
-            
-            // 【自救拆弹】连上云端说明新固件网络栈健康，取消回滚并标记为合法！
-            if (rollback_timer != NULL) {
-                xTimerStop(rollback_timer, 0);
-                ESP_LOGI(TAG, "💣 已停止变砖看门狗定时器。");
+            ESP_LOGI(TAG, "MQTT 服务器连接成功");
+            is_mqtt_connected = true;
+            if (is_pending_verify && health_event_group != NULL) {
+                xEventGroupSetBits(health_event_group, HEALTH_MQTT_CONNECTED_BIT);
             }
-            esp_ota_mark_app_valid_cancel_rollback();
-            ESP_LOGI(TAG, "✅ 当前固件已被标记为稳定版 (VALID)！");
-
-            // 订阅 OTA 升级通知主题，用于接收 Jenkins 流水线下发的固件更新 JSON
-            esp_mqtt_client_subscribe(mqtt_client, OTA_TOPIC, 1);
-            ESP_LOGI(TAG, "📥 已订阅 OTA 主题: %s", OTA_TOPIC);
+            ota_subscribe_msg_id = esp_mqtt_client_subscribe(mqtt_client, OTA_TOPIC, 1);
+            if (ota_subscribe_msg_id < 0) {
+                ESP_LOGE(TAG, "OTA 主题订阅请求失败");
+            } else {
+                ESP_LOGI(TAG, "OTA 主题订阅请求已提交: %s", OTA_TOPIC);
+            }
+            try_publish_boot_result();
             break;
         case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "🔴 MQTT 服务器已断开！");
-            is_mqtt_connected = false; // 🔴 【关键】断开后，业务立刻上锁挂起
+            ESP_LOGW(TAG, "MQTT 服务器已断开");
+            is_mqtt_connected = false;
+            ota_subscribe_msg_id = -1;
+            health_telemetry_msg_id = -1;
+            if (health_event_group != NULL) {
+                xEventGroupClearBits(health_event_group,
+                                     HEALTH_MQTT_CONNECTED_BIT | HEALTH_OTA_SUBSCRIBED_BIT);
+            }
+            break;
+        case MQTT_EVENT_SUBSCRIBED:
+            if (is_pending_verify && health_event_group != NULL &&
+                event->msg_id == ota_subscribe_msg_id) {
+                xEventGroupSetBits(health_event_group, HEALTH_OTA_SUBSCRIBED_BIT);
+                ESP_LOGI(TAG, "OTA 主题订阅已确认");
+            }
+            break;
+        case MQTT_EVENT_PUBLISHED:
+            if (is_pending_verify && health_event_group != NULL &&
+                event->msg_id == health_telemetry_msg_id) {
+                xEventGroupSetBits(health_event_group, HEALTH_TELEMETRY_ACK_BIT);
+                ESP_LOGI(TAG, "健康检查遥测消息已由 Broker 确认");
+            }
             break;
         case MQTT_EVENT_DATA:
-            ESP_LOGI(TAG, "📨 收到 MQTT 消息 -> 主题: %.*s", event->topic_len, event->topic);
-            ESP_LOGI(TAG, "📨 消息内容: %.*s", event->data_len, event->data);
+            ESP_LOGI(TAG, "收到 MQTT 消息 -> 主题: %.*s", event->topic_len, event->topic);
+            ESP_LOGI(TAG, "消息内容: %.*s", event->data_len, event->data);
 
-            // 🔧 判断是否为 OTA 升级通知
-            if (event->topic_len == strlen(OTA_TOPIC) &&
+            // 判断是否为 OTA 升级通知
+            if (event->topic_len == (int)strlen(OTA_TOPIC) &&
                 strncmp(event->topic, OTA_TOPIC, event->topic_len) == 0) {
-                ESP_LOGI(TAG, "🔔 检测到 OTA 升级通知，开始处理...");
+                ESP_LOGI(TAG, "检测到 OTA 升级通知，开始处理...");
                 handle_ota_message(event->data, event->data_len);
             }
             break;
@@ -402,8 +733,12 @@ void vTaskSensor(void *pvParameters) {
     float mock_temp = 99.0;
     float mock_hum = 50.0;
 
+    if (is_pending_verify && health_event_group != NULL) {
+        xEventGroupSetBits(health_event_group, HEALTH_SENSOR_STARTED_BIT);
+    }
+
     while (1) {
-        // 🔴 【核心修改】只认状态位，不认空指针
+        // 【核心修改】只认状态位，不认空指针
         if (is_mqtt_connected) {
             // mock_temp += 0.5;
             // if(mock_temp > 30.0) mock_temp = 25.0;
@@ -428,13 +763,16 @@ void vTaskSensor(void *pvParameters) {
             
             int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
             if (msg_id < 0) {
-                ESP_LOGE(TAG, "❌ 数据上报失败！将在下个周期重试");
+                ESP_LOGE(TAG, "数据上报失败！将在下个周期重试");
             } else {
-                ESP_LOGI(TAG, "📡 成功上报数据 -> msg_id=%d | 报文: %s", msg_id, payload);
+                if (is_pending_verify && health_telemetry_msg_id < 0) {
+                    health_telemetry_msg_id = msg_id;
+                }
+                ESP_LOGI(TAG, "成功上报数据 -> msg_id=%d | 报文: %s", msg_id, payload);
             }
         } else {
             // 网络断开时静默等待，拒绝盲目向死连接发数据
-            ESP_LOGW(TAG, "⚠️ [业务挂起] 当前网络未就绪，暂停采集上报...");
+            ESP_LOGW(TAG, "[业务挂起] 当前网络未就绪，暂停采集上报...");
         }
         
         // 保持 2 秒采样周期
@@ -445,25 +783,15 @@ void vTaskSensor(void *pvParameters) {
 // ================= 6. 系统主入口 =================
 void app_main(void) {
     ESP_LOGI(TAG, "=========================================");
-    ESP_LOGI(TAG, "🚀 嵌入式 IoT 终端启动 | OTA 空中升级已就绪");
-    ESP_LOGI(TAG, "📦 当前固件版本: %s", get_firmware_version());
+    ESP_LOGI(TAG, "嵌入式 IoT 终端启动 | OTA 空中升级已就绪");
+    ESP_LOGI(TAG, "当前固件版本: %s", get_firmware_version());
 
     // 打印当前运行的 OTA 分区信息
     const esp_partition_t *running = esp_ota_get_running_partition();
     if (running != NULL) {
-        ESP_LOGI(TAG, "💾 当前运行分区: %s (地址: 0x%08"PRIx32")", running->label, running->address);
+        ESP_LOGI(TAG, "当前运行分区: %s (地址: 0x%08"PRIx32")", running->label, running->address);
     }
     ESP_LOGI(TAG, "=========================================");
-
-    // 0. 启动防变砖生命周期看门狗 (3 分钟)
-    ESP_LOGI(TAG, "⏱️ 启动防变砖看门狗，如果 3 分钟内未连上 MQTT，将自动回退到上一版固件！");
-    rollback_timer = xTimerCreate("rollback_timer", pdMS_TO_TICKS(180000), pdFALSE, NULL, rollback_timer_cb);
-    if (rollback_timer != NULL) {
-        xTimerStart(rollback_timer, 0);
-    } else {
-        ESP_LOGE(TAG, "❌ 无法创建防变砖定时器，系统内存不足，主动重启回滚...");
-        esp_restart();
-    }
 
     // 1. 初始化 NVS
     esp_err_t ret = nvs_flash_init();
@@ -473,9 +801,40 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    bool has_boot_context = load_ota_boot_context(&boot_ota_request);
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    ret = running == NULL ? ESP_ERR_NOT_FOUND : esp_ota_get_state_partition(running, &ota_state);
+    if (ret == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        is_pending_verify = true;
+        if (!has_boot_context) {
+            snprintf(boot_ota_request.release_id, sizeof(boot_ota_request.release_id), "unknown");
+            snprintf(boot_ota_request.version, sizeof(boot_ota_request.version), "%s", get_firmware_version());
+            ESP_LOGW(TAG, "新固件缺少持久化发布上下文，将使用 unknown 标识");
+        }
+
+        ESP_LOGI(TAG, "当前镜像处于 PENDING_VERIFY，启动 180 秒业务健康检查");
+        health_event_group = xEventGroupCreate();
+        if (health_event_group == NULL ||
+            xTaskCreate(ota_health_task, "OTA_Health", 4096, NULL, 6, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "无法启动 OTA 健康检查，执行回滚");
+            esp_err_t rollback_err = esp_ota_mark_app_invalid_rollback_and_reboot();
+            ESP_LOGE(TAG, "OTA 回滚失败: %s", esp_err_to_name(rollback_err));
+            esp_restart();
+        }
+    } else {
+        ESP_LOGI(TAG, "当前镜像无需 OTA 首次启动验证");
+        if (has_boot_context) {
+            boot_report_pending = strcmp(boot_ota_request.version, get_firmware_version()) == 0
+                ? OTA_BOOT_REPORT_HEALTHY
+                : OTA_BOOT_REPORT_ROLLED_BACK;
+        }
+    }
+
     // 2. 启动 WiFi STA 模式（连接成功后会在回调中启动 MQTT）
     wifi_init_sta();
 
-    // 4. 创建业务线程
-    xTaskCreate(vTaskSensor, "Task_Sensor", 8192, NULL, 3, NULL); // 栈深度提升至 8KB，防止 MQTT 内部调用栈溢出
+    // 3. 创建业务线程；待验证镜像只有在业务线程实际启动后才允许确认
+    if (xTaskCreate(vTaskSensor, "Task_Sensor", 8192, NULL, 3, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "传感器任务创建失败");
+    }
 }

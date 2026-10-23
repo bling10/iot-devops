@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "🚀 开始模拟 ESP32 传感器数据推送..."
+echo "开始模拟 ESP32 传感器数据推送..."
 echo "按 Ctrl+C 可以停止模拟"
 
 # 发送设备上线状态
@@ -18,7 +18,7 @@ while true; do
   # 通过 mosquitto_pub 发布消息
   docker exec iot-mqtt mosquitto_pub -t 'telemetry/esp32' -m "$PAYLOAD"
 
-  echo "✅ 已推送数据: $PAYLOAD"
+  echo "已推送数据: $PAYLOAD"
 
   # 每 2 秒推送一次
   sleep 2
