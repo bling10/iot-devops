@@ -26,13 +26,14 @@ pipeline {
             agent {
                 docker {
                     image 'espressif/idf:release-v5.5'
-                    args '-u root'
+                    args '-u 1000:1000 -e HOME=/tmp'
                     reuseNode true
                 }
             }
             steps {
                 deleteDir()
                 checkout scm
+                sh 'git config --global --add safe.directory "$WORKSPACE"'
 
                 script {
                     env.GIT_SHA = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
