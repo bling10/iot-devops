@@ -80,10 +80,25 @@ for artifact in \
     fi
 done
 
+if ! command -v esptool.py >/dev/null 2>&1 \
+    && ! command -v esptool >/dev/null 2>&1 \
+    && ! python3 -c 'import esptool' >/dev/null 2>&1; then
+    if [[ -n "${IDF_PATH:-}" && -f "$IDF_PATH/export.sh" ]]; then
+        # shellcheck disable=SC1090
+        source "$IDF_PATH/export.sh" >/dev/null
+    fi
+fi
+
 if command -v esptool.py >/dev/null 2>&1; then
     esptool.py --chip esp32 image_info --version 2 "$release_path" > "$dist_dir/image-info.txt"
 elif command -v esptool >/dev/null 2>&1; then
     esptool --chip esp32 image-info "$release_path" > "$dist_dir/image-info.txt"
+elif python3 -c 'import esptool' >/dev/null 2>&1; then
+    if python3 -m esptool image-info --help >/dev/null 2>&1; then
+        python3 -m esptool --chip esp32 image-info "$release_path" > "$dist_dir/image-info.txt"
+    else
+        python3 -m esptool --chip esp32 image_info --version 2 "$release_path" > "$dist_dir/image-info.txt"
+    fi
 else
     echo "esptool is unavailable; firmware structure cannot be verified." >&2
     exit 1
