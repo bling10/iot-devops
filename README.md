@@ -155,20 +155,20 @@ flowchart LR
 
 Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行指标，并写入 InfluxDB 供 Grafana 展示。
 
-## 当前项目进度（截至 2026-10-23）
+## 当前项目进度（截至 2026-10-25）
 
 下面沿用“模块状态 + 验证记录”的进度口径：**已实现**表示仓库中有对应代码或配置，**曾验证**表示此前有实测结果，**待复验**表示本轮未重新运行该链路。不要把服务部署、MQTT 指令发送和设备升级成功视为同一件事。
 
 | 模块 | 状态 | 当前证据与剩余边界 |
 | --- | --- | --- |
-| 仓库与部署结构 | 已完成 | 本地与服务器本地 `master` 已包含 `41f93fd`；源码、Compose、运行数据、固件制品和秘密配置已分目录。9 个 Compose 镜像已固定到当时服务器在用或已缓存的软件版本。按当前决定，尚未推送服务器 GitLab。 |
-| Jenkins 构建与发布 | 第一阶段代码已完成，Job 待复验 | `Jenkinsfile` 已加入基线源码检查、ESP-IDF 构建、固件校验与归档、24 小时人工审批、审批后 SHA-256 复核、正式复制和 MQTT 下发。服务器 Jenkins 已挂载制品目录并创建钉钉凭据，但现有 Job 仍从 GitLab 的旧 `origin/master` 取 Jenkinsfile，因此尚未进行真实 Jenkins 审批流程和 OTA 发布测试。 |
+| 仓库与部署结构 | 已完成 | 本地 `master` 已提交 Wave 2 和 Wave 3，服务器工作仓库和 GitLab 尚未同步本地后续提交；源码、Compose、运行数据、固件制品和秘密配置已分目录。9 个 Compose 镜像已固定到服务器实际使用或缓存的软件版本。 |
+| Jenkins 构建与发布 | 多设备发布代码已完成，正式 Job 待验证 | `Jenkinsfile` 已加入源码与协议测试、ESP-IDF 构建、固件校验与归档、24 小时人工审批、目标设备列表和 dry-run 参数。发布脚本会再次校验制品并逐设备发送 QoS 1、非 Retain 的 v1 指令；真实 Broker 双 Topic 测试已通过，但服务器 Job 尚未读取本地 Wave 3 提交。 |
 | ESP32 OTA 与回滚 | 正确性修复已构建，待真机复验 | `main.c` 已移除 HTTP 句柄释放后使用，下载错误、长度不符或 SHA-256 不符会中止 OTA；回滚健康检查只对 `PENDING_VERIFY` 镜像运行，并以业务任务、MQTT、订阅和遥测确认作为联合条件。已在服务器使用固定 ESP-IDF 5.5 镜像完成完整编译与固件门禁验证，但下载中断、摘要不匹配和健康检查超时仍需真实 ESP32 故障注入。 |
 | 遥测与监控 | 已接入，运行待复验 | 固件遥测代码和 Telegraf、InfluxDB、Grafana 的服务配置已存在；实时面板和端到端数据入库没有在本轮重新检查。真实温湿度传感器尚未接入。 |
 | 设备模拟器 | 基础版 | `simulator/mock-esp32.sh` 目前只发送上线状态和温湿度遥测；尚不支持多 `device_id`、接收 OTA 指令或上报升级结果。 |
 | 发布协调后端 | 待实现 | 目标职责、状态模型和验收口径已写入本文；仓库中尚无后端入口、持久化模式、API 测试或部署配置。 |
 | MQTT 文件日志 | 2026-10-15 曾验证 | 当时日志目录及文件对 UID 1883 可写，`iot-mqtt` 为 `healthy`；`scripts/start.sh` 已加入权限初始化。本轮未复查服务器运行状态。 |
-| 质量、安全与论文材料 | 部分完成 | 流水线已生成镜像报告、容量报告、SHA-256 与 `manifest.json`，钉钉令牌已从当前 Jenkinsfile 迁移到只读 Docker secret 和 Jenkins Credentials。设备端大小/SHA-256 校验及最小 OTA 状态回执已通过编译，但仍待真机复验；完整源码静态分析、令牌轮换和后端最终结果闭环仍待完成。 |
+| 质量、安全与论文材料 | 部分完成 | 流水线已生成镜像报告、容量报告、SHA-256、`manifest.json` 和完整 v1 `ota-notify.json`；9 个 Python 契约测试及发布脚本异常路径测试通过。设备端大小/SHA-256 校验及最小 OTA 状态回执已通过编译，但仍待真机复验；完整源码静态分析、令牌轮换和后端最终结果闭环仍待完成。 |
 
 阶段性验证记录：
 
@@ -176,19 +176,21 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 - **2026-10-19（早期检查）**：本地静态核对了 `Jenkinsfile`、固件分区与 OTA 代码、模拟器脚本；当时 SSH 连接在认证前被服务器关闭，因此该次检查没有确认容器运行状态。
 - **2026-10-19（第一阶段实施）**：在服务器临时目录使用 `espressif/idf:release-v5.5` 完成实际构建与固件门禁验证。测试版本 `v1.0.9001` 的固件大小为 932,640 字节，OTA 分区上限为 1,835,008 字节，镜像结构、内部版本和 SHA-256 校验通过；人为修改固件一个字节后，发布 dry-run 按预期拒绝。Jenkins 2.567 容器完成重建并恢复，3 个原有 Job 保留，制品目录可写，钉钉凭据已创建。该验证没有复制正式固件、没有发送 MQTT，也没有触发真实设备 OTA。
 - **2026-10-23（OTA 正确性修复复验）**：将当前工作区以隔离方式上传到服务器临时目录，使用 `espressif/idf:release-v5.5` 完成源码基线检查、ESP32 全量编译和固件门禁验证。测试版本 `v1.0.999` 的固件大小为 949,040 字节，OTA 分区上限为 1,835,008 字节，容量状态为 `PASS`，镜像结构、内部版本和 SHA-256 校验通过。测试未修改服务器正式仓库、未复制正式固件、未发送 MQTT，也未触发真实设备 OTA；临时文件已清理。
+- **2026-10-25（MQTT OTA v1 固件）**：ESP32 已改用 Wi-Fi STA MAC 派生设备 ID，订阅设备专属 Topic，并上报 v1 状态和遥测。固定 ESP-IDF 5.5 全量构建通过，固件大小为 950,928 字节，OTA 分区上限为 1,835,008 字节。
+- **2026-10-25（多设备发布脚本）**：9 个 Python 契约测试、Linux Bash 语法检查、伪 Docker 发布行为测试全部通过；真实 Mosquitto Broker 上 `sim-ci-001` 与 `sim-ci-003` 各收到一条有效 v1 指令。测试只使用临时发布目录和非 Retain 测试 Topic，没有触发实体设备 OTA。
 
 ## 当前限制
 
 项目仍处于测试阶段，目前存在以下已知边界：
 
 - 温度暂时固定为 `99.9°C`，用于异常数据测试，尚未完成真实传感器联调。
-- OTA 消息虽然包含 MD5 字段，但设备端尚未执行摘要校验。
+- 设备已校验固件大小和 SHA-256，但尚未启用固件签名、Secure Boot 或 Flash Encryption。
 - 当前只判断远端版本是否与本地版本相同，尚未实现防降级策略。
 - OTA 采用 HTTP，MQTT 允许匿名访问，尚未完成 TLS、账号认证与 ACL 配置。
 - Wi-Fi、MQTT 地址及部分服务凭据仍存在硬编码，后续需要迁移到 NVS、环境变量和 Jenkins Credentials。
-- OTA 使用统一广播主题，尚未实现设备 ID、设备分组和灰度发布。
-- Jenkins 发布 MQTT 消息后即认为发布完成，尚未等待设备返回最终升级结果。
-- 尚无发布协调后端，也没有持久化的“发布任务—目标设备—最终结果”关联记录；当前设备离线时可能错过广播指令。
+- OTA 已使用设备专属 Topic，但尚未实现设备分组、灰度比例和批次暂停。
+- Jenkins 发布 MQTT 消息后只记录“指令已发布”，尚未等待设备返回最终升级结果。
+- 尚无发布协调后端，也没有持久化的“发布任务—目标设备—最终结果”关联记录；当前设备离线时会错过非 Retain 指令。
 - 源码仓库、容器持久化数据、固件制品和本机秘密配置已经分离；旧目录暂时保留在归档区，待稳定运行后清理。
 
 ## 网络环境说明
@@ -252,27 +254,38 @@ cd /data/devops/iot-devops
 
 ## OTA 消息格式
 
-当前 Jenkins 向 `device/esp32/ota` 发布如下消息：
+MQTT OTA v1 使用设备专属 Topic：
+
+```text
+iot/v1/devices/{device_id}/ota/command
+```
+
+Jenkins 为每个目标设备分别向对应 Topic 发布同一份已验证指令：
 
 ```json
 {
-  "version": "v1.0.35",
-  "url": "http://OTA_SERVER:8081/firmware_v1.0.35.bin",
-  "md5": "example-digest"
+  "schema_version": 1,
+  "message_type": "ota_command",
+  "release_id": "jenkins-40-36b122992057",
+  "version": "v1.0.40",
+  "target": "esp32",
+  "url": "http://OTA_SERVER:8081/firmware_v1.0.40.bin",
+  "artifact_size": 950928,
+  "sha256": "64位小写十六进制摘要"
 }
 ```
 
-后续计划改为包含设备目标、Git Commit、文件大小和 SHA-256 的发布清单，并由设备返回下载、校验、重启和健康确认结果。
+Jenkins 参数 `OTA_TARGET_DEVICE_IDS` 接收逗号、空格或换行分隔的设备 ID；`OTA_RELEASE_DRY_RUN` 默认开启，只校验目标、制品和 Topic，不复制固件、不发送 MQTT 指令。正式发布仍需通过 Jenkins 人工审批。
 
-### 目标协议与状态口径（尚未实现）
+### MQTT OTA v1 协议与状态口径
 
-后端、模拟器和 ESP32 应共用一份协议定义；以下字段是设计目标，不是当前 MQTT 消息或已上线 API 的声明。
+ESP32 固件、Jenkins 发布脚本和后续模拟器共用 [MQTT OTA v1 协议](docs/protocol/mqtt-ota-v1.md)。后端发布登记仍属于规划内容，不能把下表中的后端接口字段理解为已经上线的 API。
 
 | 消息 | 必需字段 | 作用与校验 |
 | --- | --- | --- |
 | 发布登记 | `release_id`、`build_number`、`git_commit`、`version`、`artifact_url`、`artifact_size`、`sha256`、`target_device_ids` | 同一 `release_id` 重试不得创建两个发布；后端须检查目标设备和制品元数据。 |
-| OTA 指令 | `release_id`、`device_id`、`version`、`artifact_url`、`artifact_size`、`sha256` | 设备只处理发给自己的指令；版本不合法、制品校验失败或重复指令要有可解释结果。 |
-| 设备回执 | `release_id`、`device_id`、`stage`、`result`、`reported_version`、`event_time`、可选 `error_code` | 后端按发布与设备去重并记录时间；设备重启后必须再次上报实际运行版本及健康状态。 |
+| OTA 指令 | `schema_version`、`message_type`、`release_id`、`version`、`target`、`url`、`artifact_size`、`sha256` | Topic 中的 `device_id` 是目标设备的权威标识；版本、大小或摘要不合法时设备拒绝执行。 |
+| 设备回执 | `schema_version`、`message_type`、`release_id`、`device_id`、`stage`、`result`、`reported_version`、`target_version`、`uptime_sec`、可选 `reason` | 后端按发布与设备去重并记录时间；设备重启后必须再次上报实际运行版本及健康状态。 |
 
 单设备结果建议按 `pending → downloading → verifying → rebooting → healthy` 流转，并允许在相应阶段进入 `failed`、`rolled_back` 或 `timed_out`。`healthy` 只能由目标版本重启后的设备回报产生；“指令已发送”和“下载完成”均不是终态成功。回滚应保留目标版本、实际运行的旧版本与失败原因，不能仅把它记成普通失败。超时由后端按发布任务判定；迟到回执保留为独立事件并标记为迟到，同时更新设备实际版本，不静默改写已经发出的超时结论。该规则需要状态迁移测试覆盖。
 
@@ -741,17 +754,18 @@ Jenkins 记录 RELEASED 并结束
 
 ### 当前应立即执行的任务
 
-下一步只推进一件事：**以当前 ESP32 固件和 `ota-notify.json` 为事实来源，冻结 MQTT OTA 指令、设备回执和遥测协议，然后据此实现 Python 多设备模拟器。**
+下一步只推进一件事：**同步当前多设备发布提交，然后在正式 Jenkins Job 中使用 `OTA_RELEASE_DRY_RUN=true` 完成一次人工审批流水线验证。**
 
-这一步完成后再开始发布协调后端。否则协议在模拟器、固件和后端之间反复变化，会造成状态字段、终态判断和 Grafana 查询规则重复返工。
+当前发布脚本已通过 dry-run、伪 Docker 异常测试和真实 Broker 的两个 `sim-ci` Topic 集成测试；正式 Jenkins Job 尚未读取本地 Wave 3 提交。Jenkins dry-run 通过后，再实现 Python 多设备模拟器。
 
 ## 后续工作简版路线
 
-1. 统一并冻结 MQTT OTA 指令、设备回执和遥测协议。
-2. 完成支持多设备和故障注入的 ESP32 模拟器。
-3. 实现保存发布任务与设备状态的最小后端。
-4. 将 Jenkins 发布流程接入后端，形成异步结果闭环。
-5. 完善 Telegraf 和 Grafana，展示设备及发布状态。
-6. 补充自动测试、Cppcheck、ShellCheck 和流水线质量门禁。
-7. 使用真实 ESP32 完成正常 OTA、异常处理和回滚实验。
-8. 整理实验数据，完成 README、论文、PPT 和答辩演示。
+1. 统一并冻结 MQTT OTA 指令、设备回执和遥测协议（已完成）。
+2. 完成 Jenkins 多设备定向发布和 dry-run 验证（代码与脚本验证完成，正式 Job 待验证）。
+3. 完成支持多设备和故障注入的 ESP32 模拟器。
+4. 实现保存发布任务与设备状态的最小后端。
+5. 将 Jenkins 发布流程接入后端，形成异步结果闭环。
+6. 完善 Telegraf 和 Grafana，展示设备及发布状态。
+7. 补充自动测试、Cppcheck、ShellCheck 和流水线质量门禁。
+8. 使用真实 ESP32 完成正常 OTA、异常处理和回滚实验。
+9. 整理实验数据，完成 README、论文、PPT 和答辩演示。

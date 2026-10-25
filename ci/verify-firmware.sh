@@ -145,8 +145,11 @@ EOF
 
 cat > "$dist_dir/ota-notify.json" <<EOF
 {
+  "schema_version": 1,
+  "message_type": "ota_command",
   "release_id": "${release_id}",
   "version": "${firmware_version}",
+  "target": "esp32",
   "url": "${artifact_url}",
   "artifact_size": ${firmware_size},
   "sha256": "${firmware_sha256}"

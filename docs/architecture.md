@@ -88,7 +88,7 @@ sequenceDiagram
     rect rgb(240, 220, 200)
     Note over J, E: 链路二：下行 OTA 固件分发流 (事件驱动)
     J ->> N: 编译完毕，推送 .bin 固件至目录
-    J ->> M: 发布升级指令 (Topic: device/esp32/ota)
+    J ->> M: 逐设备发布升级指令 (Topic: iot/v1/devices/{device_id}/ota/command)
     M ->> E: 下发 OTA JSON 报文
     E ->> E: 校验版本号差异
     E ->> N: 发起 HTTP GET 请求

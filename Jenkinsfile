@@ -14,9 +14,30 @@ def sendDingTalk(String title, String message) {
     }
 }
 
+// 仅用于审批和通知展示；发布脚本仍负责执行严格校验，避免界面展示逻辑成为安全边界。
+def normalizeTargetIds(String rawTargetIds) {
+    return (rawTargetIds ?: '')
+        .split(/[\s,]+/)
+        .findAll { it }
+        .unique()
+}
+
 pipeline {
     // 顶层不长期占用执行节点，每个阶段根据需要单独申请运行环境。
     agent none
+
+    parameters {
+        text(
+            name: 'OTA_TARGET_DEVICE_IDS',
+            defaultValue: 'sim-001\nsim-003',
+            description: '目标设备 ID，支持逗号、空格或换行分隔；设备 ID 只能包含小写字母、数字和连字符。'
+        )
+        booleanParam(
+            name: 'OTA_RELEASE_DRY_RUN',
+            defaultValue: true,
+            description: '开启时只校验固件、指令和目标 Topic，不复制固件且不发送 MQTT 消息。'
+        )
+    }
 
     options {
         // 代码由构建阶段显式检出，避免 Jenkins 在不合适的节点上自动检出一次。
@@ -64,13 +85,27 @@ pipeline {
                     env.GIT_SHA_SHORT = sh(returnStdout: true, script: 'git rev-parse --short=12 HEAD').trim()
                 }
 
-                // 依次执行源码基础检查、ESP-IDF 编译和固件结构/版本/大小/摘要检查。
+                // 依次执行源码基础检查、协议测试、发布脚本行为测试、ESP-IDF 编译和固件检查。
                 // 任一脚本返回非 0，流水线立即停止，不进入人工审批。
                 sh './ci/check-source.sh'
+                sh 'PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -p "test_*.py" -v'
+                sh 'bash tests/test-release-firmware.sh'
                 sh './ci/build-firmware.sh "$PROJECT_DIR" "$VERSION"'
                 sh './ci/verify-firmware.sh "$PROJECT_DIR" "$DIST_DIR" "$VERSION" "$GIT_SHA" "$BUILD_NUMBER" "$OTA_SERVER_HOST"'
 
                 script {
+                    def targetIds = normalizeTargetIds(params.OTA_TARGET_DEVICE_IDS)
+                    env.OTA_TARGET_DISPLAY = targetIds.join(', ')
+                    env.OTA_TARGET_COUNT = targetIds.size().toString()
+
+                    // 构建阶段固定执行 dry-run，让非法或空设备列表在进入人工审批前失败。
+                    withEnv([
+                        "OTA_TARGET_DEVICE_IDS=${params.OTA_TARGET_DEVICE_IDS}",
+                        'RELEASE_DRY_RUN=1'
+                    ]) {
+                        sh './ci/release-firmware.sh "$DIST_DIR" "$VERSION"'
+                    }
+
                     // 保存已验证固件的摘要，供审批通知和发布通知复用。
                     env.FIRMWARE_SHA256 = sh(
                         returnStdout: true,
@@ -92,7 +127,7 @@ pipeline {
                             // 这里只通知固件待审批，不代表 OTA 已经发布或设备升级成功。
                             sendDingTalk(
                                 'ESP32 固件待审批',
-                                "版本: ${env.VERSION}<br>Commit: ${env.GIT_SHA_SHORT}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>审批地址: ${env.BUILD_URL}input/"
+                                "版本: ${env.VERSION}<br>Commit: ${env.GIT_SHA_SHORT}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>目标设备(${env.OTA_TARGET_COUNT}): ${env.OTA_TARGET_DISPLAY}<br>发布模式: ${params.OTA_RELEASE_DRY_RUN ? 'dry-run' : 'publish'}<br>审批地址: ${env.BUILD_URL}input/"
                             )
                         } catch (err) {
                             // 通知失败不销毁已归档制品，审批人仍可从 Jenkins 页面检查构建结果。
@@ -111,7 +146,7 @@ pipeline {
                 timeout(time: 24, unit: 'HOURS')
             }
             input {
-                message '是否发布已验证的 ESP32 固件？请先检查本次构建归档中的 manifest.json、检查报告和 SHA-256。'
+                message "是否处理已验证的 ESP32 固件？目标设备: ${env.OTA_TARGET_DISPLAY}；请先检查 manifest.json、检查报告和 SHA-256。"
                 ok '批准 OTA 发布'
                 // 只有列出的 Jenkins 用户可以批准；审批人写入 APPROVED_BY。
                 submitter 'ota-release-approver,root'
@@ -132,15 +167,21 @@ pipeline {
                 deleteDir()
                 unstash 'verified-firmware'
 
-                // 脚本会再次校验 SHA-256，将固件放入正式下载目录，并通过 MQTT 发布 OTA 指令。
-                sh './ci/release-firmware.sh "$DIST_DIR" "$VERSION"'
-
                 script {
+                    // dry-run 只验证目标 Topic；正式模式才复制固件并逐设备发布 MQTT 指令。
+                    withEnv([
+                        "OTA_TARGET_DEVICE_IDS=${params.OTA_TARGET_DEVICE_IDS}",
+                        "RELEASE_DRY_RUN=${params.OTA_RELEASE_DRY_RUN ? '1' : '0'}"
+                    ]) {
+                        sh './ci/release-firmware.sh "$DIST_DIR" "$VERSION"'
+                    }
+
                     try {
-                        // MQTT 指令发布成功不等于设备升级成功，最终结果仍以设备回执为准。
+                        def notificationTitle = params.OTA_RELEASE_DRY_RUN ? 'ESP32 OTA 发布演练完成' : 'ESP32 OTA 指令已发布'
+                        def releaseStatus = params.OTA_RELEASE_DRY_RUN ? 'dry-run 已通过，未复制固件且未发送 MQTT 指令。' : '固件已发布并逐设备下发 OTA 指令，设备最终结果仍待回执。'
                         sendDingTalk(
-                            'ESP32 OTA 指令已发布',
-                            "版本: ${env.VERSION}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>状态: 固件已发布并下发 OTA 指令，设备最终结果仍待回执。<br>构建地址: ${env.BUILD_URL}"
+                            notificationTitle,
+                            "版本: ${env.VERSION}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>目标设备(${env.OTA_TARGET_COUNT}): ${env.OTA_TARGET_DISPLAY}<br>状态: ${releaseStatus}<br>构建地址: ${env.BUILD_URL}"
                         )
                     } catch (err) {
                         echo "钉钉发布通知发送失败: ${err.message}"
