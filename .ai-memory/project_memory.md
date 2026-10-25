@@ -44,6 +44,44 @@
 
 若真实构建证明 Mbed TLS 直接 SHA-256 API 与固定 ESP-IDF 5.5 镜像不兼容，则在不改变 OTA 消息协议的前提下切换为 ESP-IDF 支持的 PSA Crypto 或分区摘要实现。
 
+## Decision Record: MQTT OTA v1 多设备寻址
+
+**日期**: 2026-10-25
+**问题**: 固定设备 ID 和共享 Topic 无法区分多台 ESP32，也无法对指定设备下发和关联 OTA 状态。
+
+### 选项分析
+
+| 选项 | 优势 | 劣势 | 复杂度 |
+|---|---|---|---|
+| 共享广播 Topic | 改动少 | 无法定向发布，设备状态相互混淆 | 低 |
+| 每设备独立 Topic | 可定向发布和独立观测，结构清晰 | 发布端需要逐设备发送 | 中 |
+| 设备组与后端任务系统 | 支持离线补发和批次控制 | 超出当前最小闭环范围 | 高 |
+
+### 决策
+
+**选择**: 使用 `iot/v1/devices/{device_id}/...` 每设备独立 Topic，实体设备 ID 由 Wi-Fi STA MAC 派生，MQTT Client ID 与设备 ID 保持一致。
+
+**理由**: 不增加设备预配置和外部依赖，即可满足在线多设备定向 OTA 与状态关联。
+**Trade-offs**: v1 不保证离线补发和整批发布原子性；旧 Topic 在一个迁移窗口内仍可广播。
+
+### 影响范围
+
+- `firmware/esp32-node/main/main.c`（`@decision MQTT-OTA-V1-TRANSITION`）
+- `firmware/esp32-node/main/CMakeLists.txt`
+- `docs/protocol/mqtt-ota-v1.md`
+- 后续 Jenkins 发布脚本、模拟器和 Telegraf 配置
+
+### 验证证据
+
+- 2026-10-25 使用固定 `espressif/idf:release-v5.5` 镜像完成全量构建。
+- `main.c` 编译、ELF 链接、ESP32 镜像生成和 `ci/verify-firmware.sh` 全部通过。
+- 测试固件为 950,928 字节，OTA 分区上限为 1,835,008 字节，容量状态为 `PASS`。
+- 产物 SHA-256 为 `90c1de669e01ba2457b0d01412f434014aa23c87f935bad0119d94c4a3d79106`，编译后二进制包含三个 v1 Topic 模板和迁移期旧 Topic。
+
+### 撤销条件
+
+当发布协调后端提供设备注册、分组、离线任务和持久化幂等后，重新评估 Topic 路由与设备身份来源，并移除旧 Topic 兼容订阅。
+
 ## Glossary
 
 - **源码检测**：对构建前的 C/C++ 源文件和编译诊断进行检查。

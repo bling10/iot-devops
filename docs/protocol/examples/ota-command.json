@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "message_type": "ota_command",
+  "release_id": "jenkins-40-36b122992057",
+  "version": "v1.0.40",
+  "target": "esp32",
+  "url": "http://192.168.100.60:8081/firmware_v1.0.40.bin",
+  "artifact_size": 949040,
+  "sha256": "911a930dce5e1ffc06d9f789ad28ba43973f0c496db8b3e4b080bfab32e50395"
+}

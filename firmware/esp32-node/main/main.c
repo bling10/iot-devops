@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -33,13 +34,19 @@ void mqtt_app_start(void);      // 前置声明
 #define WIFI_SSID          "wifi"                  // 确保是 2.4GHz 频段的热点
 #define WIFI_PASS          "888888889999"          // WiFi 密码
 #define MQTT_BROKER        "mqtt://192.168.249.60" // 虚拟机 IP（确保桥接模式，两端互通）
-#define DEVICE_ID          "esp32"
-#define MQTT_TOPIC         "telemetry/sensors"
-#define OTA_TOPIC          "device/esp32/ota"      // OTA 升级通知订阅主题
-#define OTA_STATUS_TOPIC   "device/esp32/status"   // OTA 阶段与最终结果回执主题
+#define MQTT_TELEMETRY_TOPIC_FORMAT "iot/v1/devices/%s/telemetry"
+#define MQTT_OTA_TOPIC_FORMAT       "iot/v1/devices/%s/ota/command"
+#define MQTT_OTA_STATUS_TOPIC_FORMAT "iot/v1/devices/%s/ota/status"
+// @decision MQTT-OTA-V1-TRANSITION 旧 Topic 仅保留一个迁移窗口，并只兼容原有五字段指令
+#define LEGACY_OTA_TOPIC    "device/esp32/ota"
+#define MQTT_TOPIC_MAX_LEN  128
+#define DEVICE_ID_MAX_LEN   65
 #define OTA_BUF_SIZE       1024                    // OTA 下载缓冲区大小
 #define OTA_MESSAGE_MAX_LEN 2048
 #define OTA_HEALTH_TIMEOUT_MS 180000
+#define OTA_SCHEMA_VERSION 1
+#define OTA_MESSAGE_TYPE   "ota_command"
+#define OTA_TARGET         "esp32"
 #define OTA_RELEASE_ID_MAX_LEN 96
 #define OTA_VERSION_MAX_LEN 32
 #define OTA_URL_MAX_LEN    256
@@ -74,14 +81,65 @@ static const char *TAG = "IOT_NODE";
 
 // 全局句柄与真实连接状态位
 esp_mqtt_client_handle_t mqtt_client = NULL;
+static char device_id[DEVICE_ID_MAX_LEN] = {0};
+static char telemetry_topic[MQTT_TOPIC_MAX_LEN] = {0};
+static char ota_topic[MQTT_TOPIC_MAX_LEN] = {0};
+static char ota_status_topic[MQTT_TOPIC_MAX_LEN] = {0};
 static volatile bool is_mqtt_connected = false; // 【修复】volatile 保证多任务/中断间可见性
 static volatile bool is_ota_in_progress = false; // OTA 进行中标志，防止重复触发
 static volatile bool is_pending_verify = false;
 static EventGroupHandle_t health_event_group = NULL;
 static int ota_subscribe_msg_id = -1;
+static int legacy_ota_subscribe_msg_id = -1;
 static int health_telemetry_msg_id = -1;
 static ota_request_t boot_ota_request = {0};
 static ota_boot_report_t boot_report_pending = OTA_BOOT_REPORT_NONE;
+
+static esp_err_t initialize_device_identity(void)
+{
+    uint8_t mac[6];
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    int written = snprintf(
+        device_id,
+        sizeof(device_id),
+        "esp32-%02x%02x%02x%02x%02x%02x",
+        (unsigned int)mac[0], (unsigned int)mac[1], (unsigned int)mac[2],
+        (unsigned int)mac[3], (unsigned int)mac[4], (unsigned int)mac[5]
+    );
+    if (written < 0 || (size_t)written >= sizeof(device_id)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    written = snprintf(telemetry_topic, sizeof(telemetry_topic),
+                       MQTT_TELEMETRY_TOPIC_FORMAT, device_id);
+    if (written < 0 || (size_t)written >= sizeof(telemetry_topic)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    written = snprintf(ota_topic, sizeof(ota_topic), MQTT_OTA_TOPIC_FORMAT, device_id);
+    if (written < 0 || (size_t)written >= sizeof(ota_topic)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    written = snprintf(ota_status_topic, sizeof(ota_status_topic),
+                       MQTT_OTA_STATUS_TOPIC_FORMAT, device_id);
+    if (written < 0 || (size_t)written >= sizeof(ota_status_topic)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+static bool mqtt_topic_matches(esp_mqtt_event_handle_t event, const char *expected_topic)
+{
+    size_t expected_length = strlen(expected_topic);
+    return event->topic_len == (int)expected_length &&
+           strncmp(event->topic, expected_topic, expected_length) == 0;
+}
 
 static const char *get_firmware_version(void)
 {
@@ -115,8 +173,10 @@ static bool publish_ota_status(const ota_request_t *request, const char *stage, 
         return false;
     }
 
+    cJSON_AddNumberToObject(root, "schema_version", OTA_SCHEMA_VERSION);
+    cJSON_AddStringToObject(root, "message_type", "ota_status");
     cJSON_AddStringToObject(root, "release_id", request->release_id);
-    cJSON_AddStringToObject(root, "device_id", DEVICE_ID);
+    cJSON_AddStringToObject(root, "device_id", device_id);
     cJSON_AddStringToObject(root, "stage", stage);
     cJSON_AddStringToObject(root, "result", ota_result_for_stage(stage));
     cJSON_AddStringToObject(root, "reported_version", get_firmware_version());
@@ -136,7 +196,7 @@ static bool publish_ota_status(const ota_request_t *request, const char *stage, 
         return false;
     }
 
-    int msg_id = esp_mqtt_client_publish(mqtt_client, OTA_STATUS_TOPIC, payload, 0, 1, 0);
+    int msg_id = esp_mqtt_client_publish(mqtt_client, ota_status_topic, payload, 0, 1, 0);
     cJSON_free(payload);
     if (msg_id < 0) {
         ESP_LOGE(TAG, "OTA 状态回执发送失败: %s", stage);
@@ -278,7 +338,7 @@ static void ota_task(void *pvParameters)
     esp_ota_handle_t ota_handle = 0;
     mbedtls_sha256_context sha_context;
     char *buffer = NULL;
-    const char *failure_reason = "unknown";
+    const char *failure_reason = "internal_error";
     bool ota_started = false;
     size_t total_read = 0;
     int last_progress = -1;
@@ -485,8 +545,11 @@ cleanup:
  * 
  * 预期 JSON 格式（由 Jenkins 流水线生成）：
  * {
+ *   "schema_version": 1,
+ *   "message_type": "ota_command",
  *   "release_id": "jenkins-36-abc123def456",
  *   "version": "v1.0.12",
+ *   "target": "esp32",
  *   "url": "http://192.168.249.60:8081/firmware_v1.0.12.bin",
  *   "artifact_size": 927104,
  *   "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -526,12 +589,68 @@ static bool normalize_sha256(char sha256[OTA_SHA256_HEX_LEN + 1])
     return true;
 }
 
-static void handle_ota_message(const char *data, int data_len)
+static bool is_valid_firmware_version(const char *version)
 {
-    if (is_ota_in_progress) {
-        ESP_LOGW(TAG, "OTA 升级正在进行中，忽略重复通知");
-        return;
+    if (version == NULL || version[0] != 'v') {
+        return false;
     }
+
+    int dot_count = 0;
+    int component_length = 0;
+    for (size_t i = 1; version[i] != '\0'; i++) {
+        unsigned char value = (unsigned char)version[i];
+        if (isdigit(value)) {
+            component_length++;
+            continue;
+        }
+        if (value != '.' || component_length == 0 || dot_count >= 2) {
+            return false;
+        }
+        dot_count++;
+        component_length = 0;
+    }
+
+    return dot_count == 2 && component_length > 0;
+}
+
+static const char *validate_ota_envelope(cJSON *root, bool allow_legacy_envelope,
+                                         bool *uses_legacy_envelope)
+{
+    cJSON *schema_version = cJSON_GetObjectItemCaseSensitive(root, "schema_version");
+    cJSON *message_type = cJSON_GetObjectItemCaseSensitive(root, "message_type");
+    cJSON *target = cJSON_GetObjectItemCaseSensitive(root, "target");
+    bool has_envelope = schema_version != NULL || message_type != NULL || target != NULL;
+
+    *uses_legacy_envelope = allow_legacy_envelope && !has_envelope;
+    if (*uses_legacy_envelope) {
+        return NULL;
+    }
+
+    if (!cJSON_IsNumber(schema_version) ||
+        schema_version->valuedouble != (double)schema_version->valueint) {
+        return "invalid_payload";
+    }
+    if (schema_version->valueint != OTA_SCHEMA_VERSION) {
+        return "unsupported_schema_version";
+    }
+    if (!cJSON_IsString(message_type) || message_type->valuestring == NULL) {
+        return "invalid_payload";
+    }
+    if (strcmp(message_type->valuestring, OTA_MESSAGE_TYPE) != 0) {
+        return "invalid_message_type";
+    }
+    if (!cJSON_IsString(target) || target->valuestring == NULL) {
+        return "invalid_payload";
+    }
+    if (strcmp(target->valuestring, OTA_TARGET) != 0) {
+        return "target_mismatch";
+    }
+
+    return NULL;
+}
+
+static void handle_ota_message(const char *data, int data_len, bool allow_legacy_envelope)
+{
     if (data == NULL || data_len <= 0 || data_len > OTA_MESSAGE_MAX_LEN) {
         ESP_LOGE(TAG, "OTA 消息长度非法: %d", data_len);
         return;
@@ -575,14 +694,43 @@ static void handle_ota_message(const char *data, int data_len)
         request->artifact_size = (size_t)artifact_size_item->valuedouble;
     }
 
+    bool uses_legacy_envelope = false;
+    const char *envelope_error = validate_ota_envelope(
+        root, allow_legacy_envelope, &uses_legacy_envelope
+    );
     cJSON_Delete(root);
-    if (!fields_valid || !normalize_sha256(request->sha256)) {
+    if (!fields_valid || !normalize_sha256(request->sha256) ||
+        !is_valid_firmware_version(request->version)) {
         ESP_LOGE(TAG, "OTA 发布清单校验失败");
+        if (request->release_id[0] != '\0' && request->version[0] != '\0') {
+            publish_ota_status(request, "failed", "invalid_payload");
+        }
         free(request);
         return;
     }
     if (strncmp(request->url, "http://", 7) != 0 && strncmp(request->url, "https://", 8) != 0) {
         ESP_LOGE(TAG, "OTA URL 必须使用 HTTP 或 HTTPS");
+        publish_ota_status(request, "failed", "invalid_payload");
+        free(request);
+        return;
+    }
+    if (envelope_error != NULL) {
+        ESP_LOGE(TAG, "OTA v1 信封校验失败: %s", envelope_error);
+        publish_ota_status(
+            request,
+            strcmp(envelope_error, "target_mismatch") == 0 ? "skipped" : "failed",
+            envelope_error
+        );
+        free(request);
+        return;
+    }
+    if (uses_legacy_envelope) {
+        ESP_LOGW(TAG, "收到旧格式 OTA 指令，仅用于协议迁移");
+    }
+
+    if (is_ota_in_progress) {
+        ESP_LOGW(TAG, "OTA 升级正在进行中，拒绝并发任务");
+        publish_ota_status(request, "skipped", "ota_busy");
         free(request);
         return;
     }
@@ -644,11 +792,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (is_pending_verify && health_event_group != NULL) {
                 xEventGroupSetBits(health_event_group, HEALTH_MQTT_CONNECTED_BIT);
             }
-            ota_subscribe_msg_id = esp_mqtt_client_subscribe(mqtt_client, OTA_TOPIC, 1);
+            ota_subscribe_msg_id = esp_mqtt_client_subscribe(mqtt_client, ota_topic, 1);
             if (ota_subscribe_msg_id < 0) {
-                ESP_LOGE(TAG, "OTA 主题订阅请求失败");
+                ESP_LOGE(TAG, "OTA v1 主题订阅请求失败");
             } else {
-                ESP_LOGI(TAG, "OTA 主题订阅请求已提交: %s", OTA_TOPIC);
+                ESP_LOGI(TAG, "OTA v1 主题订阅请求已提交: %s", ota_topic);
+            }
+            legacy_ota_subscribe_msg_id = esp_mqtt_client_subscribe(
+                mqtt_client, LEGACY_OTA_TOPIC, 1
+            );
+            if (legacy_ota_subscribe_msg_id < 0) {
+                ESP_LOGW(TAG, "旧 OTA 主题订阅请求失败");
+            } else {
+                ESP_LOGI(TAG, "旧 OTA 主题订阅请求已提交: %s", LEGACY_OTA_TOPIC);
             }
             try_publish_boot_result();
             break;
@@ -656,6 +812,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGW(TAG, "MQTT 服务器已断开");
             is_mqtt_connected = false;
             ota_subscribe_msg_id = -1;
+            legacy_ota_subscribe_msg_id = -1;
             health_telemetry_msg_id = -1;
             if (health_event_group != NULL) {
                 xEventGroupClearBits(health_event_group,
@@ -666,7 +823,9 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             if (is_pending_verify && health_event_group != NULL &&
                 event->msg_id == ota_subscribe_msg_id) {
                 xEventGroupSetBits(health_event_group, HEALTH_OTA_SUBSCRIBED_BIT);
-                ESP_LOGI(TAG, "OTA 主题订阅已确认");
+                ESP_LOGI(TAG, "OTA v1 主题订阅已确认");
+            } else if (event->msg_id == legacy_ota_subscribe_msg_id) {
+                ESP_LOGI(TAG, "旧 OTA 主题订阅已确认");
             }
             break;
         case MQTT_EVENT_PUBLISHED:
@@ -680,11 +839,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGI(TAG, "收到 MQTT 消息 -> 主题: %.*s", event->topic_len, event->topic);
             ESP_LOGI(TAG, "消息内容: %.*s", event->data_len, event->data);
 
-            // 判断是否为 OTA 升级通知
-            if (event->topic_len == (int)strlen(OTA_TOPIC) &&
-                strncmp(event->topic, OTA_TOPIC, event->topic_len) == 0) {
+            bool is_v1_topic = mqtt_topic_matches(event, ota_topic);
+            bool is_legacy_topic = mqtt_topic_matches(event, LEGACY_OTA_TOPIC);
+            if (is_v1_topic || is_legacy_topic) {
                 ESP_LOGI(TAG, "检测到 OTA 升级通知，开始处理...");
-                handle_ota_message(event->data, event->data_len);
+                handle_ota_message(event->data, event->data_len, is_legacy_topic);
             }
             break;
         default:
@@ -719,6 +878,7 @@ void wifi_init_sta(void) {
 void mqtt_app_start(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MQTT_BROKER,
+        .credentials.client_id = device_id,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -729,7 +889,7 @@ void mqtt_app_start(void) {
 
 // 任务一：传感器采集与上报
 void vTaskSensor(void *pvParameters) {
-    char payload[256];
+    char payload[384];
     float mock_temp = 99.0;
     float mock_hum = 50.0;
 
@@ -757,11 +917,25 @@ void vTaskSensor(void *pvParameters) {
             // 获取连续运行时间 (秒)
             uint32_t uptime_sec = (uint32_t)(esp_timer_get_time() / 1000000);
 
-            snprintf(payload, sizeof(payload), 
-                "{\"temperature\": %.2f, \"humidity\": %.2f, \"rssi\": %d, \"free_heap\": %lu, \"uptime_sec\": %lu, \"version\": \"%s\"}", 
-                mock_temp, mock_hum, rssi, free_heap, uptime_sec, get_firmware_version());
+            int payload_length = snprintf(
+                payload,
+                sizeof(payload),
+                "{\"schema_version\":1,\"message_type\":\"telemetry\",\"device_id\":\"%s\","
+                "\"temperature\":%.2f,\"humidity\":%.2f,\"rssi\":%d,"
+                "\"free_heap\":%" PRIu32 ",\"uptime_sec\":%" PRIu32 ","
+                "\"version\":\"%s\"}",
+                device_id, mock_temp, mock_hum, rssi, free_heap, uptime_sec,
+                get_firmware_version()
+            );
+            if (payload_length < 0 || (size_t)payload_length >= sizeof(payload)) {
+                ESP_LOGE(TAG, "遥测消息生成失败或超出缓冲区");
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
             
-            int msg_id = esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, payload, 0, 1, 0);
+            int msg_id = esp_mqtt_client_publish(
+                mqtt_client, telemetry_topic, payload, 0, 1, 0
+            );
             if (msg_id < 0) {
                 ESP_LOGE(TAG, "数据上报失败！将在下个周期重试");
             } else {
@@ -800,6 +974,12 @@ void app_main(void) {
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(initialize_device_identity());
+    ESP_LOGI(TAG, "设备 ID: %s", device_id);
+    ESP_LOGI(TAG, "遥测主题: %s", telemetry_topic);
+    ESP_LOGI(TAG, "OTA 指令主题: %s", ota_topic);
+    ESP_LOGI(TAG, "OTA 状态主题: %s", ota_status_topic);
 
     bool has_boot_context = load_ota_boot_context(&boot_ota_request);
     esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "message_type": "telemetry",
+  "device_id": "sim-001",
+  "temperature": 26.4,
+  "humidity": 58.2,
+  "rssi": -53,
+  "free_heap": 183420,
+  "uptime_sec": 3600,
+  "version": "v1.0.40"
+}

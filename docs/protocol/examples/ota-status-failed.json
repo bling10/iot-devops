@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "message_type": "ota_status",
+  "release_id": "jenkins-40-36b122992057",
+  "device_id": "sim-002",
+  "stage": "failed",
+  "result": "failed",
+  "reported_version": "v1.0.39",
+  "target_version": "v1.0.40",
+  "artifact_size": 949040,
+  "uptime_sec": 126,
+  "reason": "sha256_mismatch"
+}
