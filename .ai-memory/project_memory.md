@@ -121,6 +121,37 @@
 
 当发布协调后端接管设备列表、持久化发布任务和 MQTT 下发后，Jenkins 改为只登记发布任务，逐设备失败汇总逻辑迁移到后端。
 
+## Decision Record: Jenkins 发布运行环境与阶段重启上下文
+
+**日期**: 2026-10-25
+**问题**: Release OTA 阶段调用 Python 3 校验发布指令，但基础 Jenkins 镜像不包含 Python；从失败阶段重启会产生新的 `BUILD_NUMBER`，而恢复的 stash 仍属于原始构建，导致版本目录错位。
+
+### 选项分析
+
+| 选项 | 优势 | 劣势 | 复杂度 |
+|---|---|---|---|
+| 在运行容器中临时安装 Python | 可立即恢复 | 容器重建后丢失，无法复现 | 低 |
+| 自定义 Jenkins 镜像并随制品保存发布元数据 | 依赖持久、阶段重启仍使用已审批制品 | 增加一个镜像构建步骤和少量元数据代码 | 中 |
+| 拆分独立发布 Job 或交给后端 | 职责最清晰 | 超出当前最小闭环范围 | 高 |
+
+### 决策
+
+**选择**: 基于固定 Jenkins 版本构建项目镜像并安装 Python 3；构建阶段将版本、制品目录、SHA-256、目标设备和 dry-run 模式写入 `release-metadata.properties`，与固件一同 stash，Release 阶段恢复后覆盖重新计算的环境变量。
+
+**理由**: 同时消除临时安装和阶段重启目录错位，且不改变现有构建、审批和发布边界。
+**Trade-offs**: 自定义镜像中的 Debian 软件包版本由镜像构建时的软件源决定；Jenkinsfile 元数据读取逻辑仍需正式 Job 解析和 Restart from Stage 实测。
+
+### 影响范围
+
+- `deploy/jenkins/Dockerfile`
+- `deploy/jenkins/compose.yml`
+- `Jenkinsfile`
+- `tests/test_release_pipeline_contract.py`
+
+### 撤销条件
+
+当发布协调后端或独立 Release Job 接管已验证制品时，移除 Jenkins 内的发布上下文恢复逻辑；若 Jenkins 节点改为外部 Agent，则把 Python 3 依赖迁移到对应固定 Agent 镜像。
+
 ## Glossary
 
 - **源码检测**：对构建前的 C/C++ 源文件和编译诊断进行检查。

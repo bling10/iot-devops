@@ -1,9 +1,9 @@
 ## Handoff Checkpoint
 
-**更新时间**: 2026-10-25 19:55
+**更新时间**: 2026-10-25
 **当前目标**: 完成 MQTT OTA v1 的多设备最小闭环
-**当前阶段**: Wave 3 已在本地提交，等待同步并运行正式 Jenkins Job dry-run
-**完成度**: Wave 3 为 80%（代码、行为测试、制品生成和 Broker 发布已验证；正式 Jenkins Job 未运行）
+**当前阶段**: Wave 3 正式 dry-run 已完成；Jenkins 运行镜像与阶段重启加固已实现，待部署复验
+**完成度**: Wave 3 为 100%；流水线加固为 70%（代码、契约测试和隔离镜像验证完成，正式部署与 Restart from Stage 未验证）
 
 ### 已完成
 
@@ -12,11 +12,15 @@
 - 固定 ESP-IDF 5.5 镜像全量构建和 `verify-firmware.sh` 通过；固件为 950,928 字节。
 - Jenkins 参数、完整 v1 指令生成、设备 ID 校验/去重和逐设备发布已实现。
 - 发布脚本行为测试和真实 Broker 的两个 `sim-ci` Topic 集成测试通过。
+- 正式 Jenkins Job `#42` 已完成构建、人工审批和两个目标设备的 dry-run。
+- 自定义 Jenkins 镜像固定安装 Python 3；发布上下文已随 stash 保存并在 Release 阶段恢复。
+- 自定义镜像已在服务器隔离构建验证：默认用户为 `jenkins`（UID 1000），Python 为 `/usr/bin/python3` 3.13.5；未影响正式容器。
 
 ### 未完成
 
-- 同步 Wave 3 提交，让正式 Jenkins Job 读取新 Jenkinsfile。
-- 使用 `OTA_RELEASE_DRY_RUN=true` 完成一次正式人工审批流水线验证。
+- 提交并同步当前流水线加固改动。
+- 在正式 Compose 目录构建自定义 Jenkins 镜像，重建容器后确认 Python 3 持久存在。
+- 从 Release OTA 阶段重启一次构建，验证仍使用原始版本和制品目录。
 - 后续实现多设备模拟器并验证设备状态回执。
 
 ### 关键决策
@@ -24,20 +28,21 @@
 - 正式 Topic 使用 `iot/v1/devices/{device_id}/...`；旧 Topic 仅保留一个迁移窗口。
 - 实体设备 ID 使用 Wi-Fi STA MAC，模拟设备后续使用启动参数指定 ID。
 - 多设备发布尝试全部合法目标后汇总结果；任一设备发布失败时流水线失败。
+- Release 阶段只使用随已验证制品 stash 的原始发布元数据，不根据重启后的新 `BUILD_NUMBER` 重新推导版本。
 
 ### 恢复入口
 
 - **首读文件**: `Jenkinsfile`、`ci/release-firmware.sh`、`docs/protocol/mqtt-ota-v1.md`
 - **关键命令**: `py -3 -B -m unittest discover -s tests -p "test_*.py" -v`
-- **验证路径**: 提交后同步到 Jenkins SCM，使用 `sim-001`、`sim-003` 和 `OTA_RELEASE_DRY_RUN=true` 运行完整审批流程。
+- **验证路径**: 部署自定义 Jenkins 镜像后检查 `python3 --version`，完整运行一次 dry-run，再从 Release OTA 阶段重启并核对原始版本。
 
 ### 阻塞项
 
-- Jenkins 校验端点匿名访问返回 403，因此 Jenkinsfile 尚未由正式 Jenkins 解析；需提交同步后通过真实 Job 验证。
+- 当前加固版 Jenkinsfile 尚未由正式 Jenkins 解析；需要同步并通过真实 Job 验证 Groovy 和阶段重启路径。
 
 ## 交接
 
-- **已完成项**（带验证证据）：固件 v1 适配、Python 契约测试 9/9、发布行为测试、真实 Broker 双 Topic 发布、ESP-IDF 5.5 制品生成均通过。
-- **相关文件**（精确路径 + 行号）：`Jenkinsfile:29`、`Jenkinsfile:93`、`ci/release-firmware.sh:8`、`ci/verify-firmware.sh:146`、`tests/test-release-firmware.sh:1`、`tests/test-broker-integration.sh:1`。
-- **未完成项**（下一步 + 入口）：同步 Wave 3，然后以 dry-run 参数运行正式 Jenkins Job。
-- **阻塞项**（决策点）：正式 Jenkinsfile 解析与完整 Job 运行必须在同步后验证。
+- **已完成项**（带验证证据）：Wave 3 正式 Job `#42` dry-run 通过；Jenkins 固定 Python 3 镜像和发布元数据恢复代码已通过本地契约测试。
+- **相关文件**（精确路径 + 行号）：`deploy/jenkins/Dockerfile:1`、`deploy/jenkins/compose.yml:3`、`Jenkinsfile:25`、`tests/test_release_pipeline_contract.py:1`。
+- **未完成项**（下一步 + 入口）：提交同步加固改动，构建并部署 Jenkins 镜像，再复验完整 dry-run 和 Release OTA 阶段重启。
+- **阻塞项**（决策点）：服务器 Jenkins 容器重建会影响正在运行的 Job，部署前应确认当前无活跃构建。

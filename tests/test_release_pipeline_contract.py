@@ -6,6 +6,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 VERIFY_SCRIPT = (REPO_ROOT / "ci" / "verify-firmware.sh").read_text(encoding="utf-8")
 RELEASE_SCRIPT = (REPO_ROOT / "ci" / "release-firmware.sh").read_text(encoding="utf-8")
 JENKINSFILE = (REPO_ROOT / "Jenkinsfile").read_text(encoding="utf-8")
+JENKINS_DOCKERFILE = (REPO_ROOT / "deploy" / "jenkins" / "Dockerfile").read_text(
+    encoding="utf-8"
+)
+JENKINS_COMPOSE = (REPO_ROOT / "deploy" / "jenkins" / "compose.yml").read_text(
+    encoding="utf-8"
+)
 
 
 class ReleasePipelineContractTests(unittest.TestCase):
@@ -47,6 +53,43 @@ class ReleasePipelineContractTests(unittest.TestCase):
         ):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, JENKINSFILE)
+
+    def test_jenkins_runtime_persistently_provides_python3(self):
+        for fragment in (
+            "FROM jenkins/jenkins:2.567-jdk21",
+            "apt-get install -y --no-install-recommends python3",
+            "USER jenkins",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, JENKINS_DOCKERFILE)
+
+        for fragment in (
+            "build:",
+            "dockerfile: Dockerfile",
+            "image: iot-jenkins:2.567-jdk21-python3",
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, JENKINS_COMPOSE)
+
+    def test_release_restart_uses_stashed_original_metadata(self):
+        for fragment in (
+            "release-metadata.properties",
+            "loadReleaseMetadata",
+            "OTA_TARGET_DEVICE_IDS_RESOLVED",
+            "OTA_RELEASE_DRY_RUN_RESOLVED",
+            "env.VERSION = releaseMetadata['VERSION']",
+            "env.DIST_DIR = releaseMetadata['DIST_DIR']",
+            "env.FIRMWARE_SHA256 = releaseMetadata['FIRMWARE_SHA256']",
+            '"OTA_TARGET_DEVICE_IDS=${env.OTA_TARGET_DEVICE_IDS_RESOLVED}"',
+            '"RELEASE_DRY_RUN=${env.OTA_RELEASE_DRY_RUN_RESOLVED}"',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, JENKINSFILE)
+
+        self.assertIn(
+            "release-metadata.properties,ci/release-firmware.sh",
+            JENKINSFILE,
+        )
 
 
 if __name__ == "__main__":

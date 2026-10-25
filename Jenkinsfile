@@ -22,6 +22,42 @@ def normalizeTargetIds(String rawTargetIds) {
         .unique()
 }
 
+// 从构建阶段随制品保存的元数据恢复发布上下文。
+// Jenkins 从阶段重启时会产生新的 BUILD_NUMBER，因此发布阶段不能重新推导版本和目录。
+def loadReleaseMetadata(String filePath) {
+    def metadata = [:]
+    readFile(file: filePath).readLines().eachWithIndex { rawLine, index ->
+        def line = rawLine.trim()
+        if (line && !line.startsWith('#')) {
+            def separator = line.indexOf('=')
+            if (separator < 1) {
+                error "Invalid release metadata at line ${index + 1}: ${filePath}"
+            }
+            def key = line.substring(0, separator)
+            def value = line.substring(separator + 1)
+            if (metadata.containsKey(key)) {
+                error "Duplicate release metadata key: ${key}"
+            }
+            metadata[key] = value
+        }
+    }
+
+    [
+        'VERSION',
+        'DIST_DIR',
+        'FIRMWARE_SHA256',
+        'OTA_TARGET_DEVICE_IDS_RESOLVED',
+        'OTA_TARGET_DISPLAY',
+        'OTA_TARGET_COUNT',
+        'OTA_RELEASE_DRY_RUN_RESOLVED'
+    ].each { key ->
+        if (!metadata[key]) {
+            error "Required release metadata is missing: ${key}"
+        }
+    }
+    return metadata
+}
+
 pipeline {
     // 顶层不长期占用执行节点，每个阶段根据需要单独申请运行环境。
     agent none
@@ -95,8 +131,10 @@ pipeline {
 
                 script {
                     def targetIds = normalizeTargetIds(params.OTA_TARGET_DEVICE_IDS)
+                    env.OTA_TARGET_DEVICE_IDS_RESOLVED = targetIds.join(',')
                     env.OTA_TARGET_DISPLAY = targetIds.join(', ')
                     env.OTA_TARGET_COUNT = targetIds.size().toString()
+                    env.OTA_RELEASE_DRY_RUN_RESOLVED = params.OTA_RELEASE_DRY_RUN ? '1' : '0'
 
                     // 构建阶段固定执行 dry-run，让非法或空设备列表在进入人工审批前失败。
                     withEnv([
@@ -111,11 +149,24 @@ pipeline {
                         returnStdout: true,
                         script: 'cut -d " " -f 1 "$DIST_DIR/firmware.sha256"'
                     ).trim()
+
+                    // 发布阶段只读取这份已审批上下文，避免阶段重启后使用新的 BUILD_NUMBER。
+                    writeFile(
+                        file: 'release-metadata.properties',
+                        text: """VERSION=${env.VERSION}
+DIST_DIR=${env.DIST_DIR}
+FIRMWARE_SHA256=${env.FIRMWARE_SHA256}
+OTA_TARGET_DEVICE_IDS_RESOLVED=${env.OTA_TARGET_DEVICE_IDS_RESOLVED}
+OTA_TARGET_DISPLAY=${env.OTA_TARGET_DISPLAY}
+OTA_TARGET_COUNT=${env.OTA_TARGET_COUNT}
+OTA_RELEASE_DRY_RUN_RESOLVED=${env.OTA_RELEASE_DRY_RUN_RESOLVED}
+"""
+                    )
                 }
 
                 // archiveArtifacts 面向人工下载和长期追溯；stash 用于后续阶段传递同一份制品。
                 archiveArtifacts artifacts: "${env.DIST_DIR}/**", fingerprint: true
-                stash name: 'verified-firmware', includes: "${env.DIST_DIR}/**,ci/release-firmware.sh,ci/notify-dingtalk.sh"
+                stash name: 'verified-firmware', includes: "${env.DIST_DIR}/**,release-metadata.properties,ci/release-firmware.sh,ci/notify-dingtalk.sh"
 
                 // 当新构建到达相同里程碑时，较旧且仍停留在前面阶段的构建会失效。
                 milestone ordinal: 10
@@ -168,17 +219,27 @@ pipeline {
                 unstash 'verified-firmware'
 
                 script {
+                    def releaseMetadata = loadReleaseMetadata('release-metadata.properties')
+                    env.VERSION = releaseMetadata['VERSION']
+                    env.DIST_DIR = releaseMetadata['DIST_DIR']
+                    env.FIRMWARE_SHA256 = releaseMetadata['FIRMWARE_SHA256']
+                    env.OTA_TARGET_DEVICE_IDS_RESOLVED = releaseMetadata['OTA_TARGET_DEVICE_IDS_RESOLVED']
+                    env.OTA_TARGET_DISPLAY = releaseMetadata['OTA_TARGET_DISPLAY']
+                    env.OTA_TARGET_COUNT = releaseMetadata['OTA_TARGET_COUNT']
+                    env.OTA_RELEASE_DRY_RUN_RESOLVED = releaseMetadata['OTA_RELEASE_DRY_RUN_RESOLVED']
+
                     // dry-run 只验证目标 Topic；正式模式才复制固件并逐设备发布 MQTT 指令。
                     withEnv([
-                        "OTA_TARGET_DEVICE_IDS=${params.OTA_TARGET_DEVICE_IDS}",
-                        "RELEASE_DRY_RUN=${params.OTA_RELEASE_DRY_RUN ? '1' : '0'}"
+                        "OTA_TARGET_DEVICE_IDS=${env.OTA_TARGET_DEVICE_IDS_RESOLVED}",
+                        "RELEASE_DRY_RUN=${env.OTA_RELEASE_DRY_RUN_RESOLVED}"
                     ]) {
                         sh './ci/release-firmware.sh "$DIST_DIR" "$VERSION"'
                     }
 
                     try {
-                        def notificationTitle = params.OTA_RELEASE_DRY_RUN ? 'ESP32 OTA 发布演练完成' : 'ESP32 OTA 指令已发布'
-                        def releaseStatus = params.OTA_RELEASE_DRY_RUN ? 'dry-run 已通过，未复制固件且未发送 MQTT 指令。' : '固件已发布并逐设备下发 OTA 指令，设备最终结果仍待回执。'
+                        def isDryRun = env.OTA_RELEASE_DRY_RUN_RESOLVED == '1'
+                        def notificationTitle = isDryRun ? 'ESP32 OTA 发布演练完成' : 'ESP32 OTA 指令已发布'
+                        def releaseStatus = isDryRun ? 'dry-run 已通过，未复制固件且未发送 MQTT 指令。' : '固件已发布并逐设备下发 OTA 指令，设备最终结果仍待回执。'
                         sendDingTalk(
                             notificationTitle,
                             "版本: ${env.VERSION}<br>SHA-256: ${env.FIRMWARE_SHA256}<br>目标设备(${env.OTA_TARGET_COUNT}): ${env.OTA_TARGET_DISPLAY}<br>状态: ${releaseStatus}<br>构建地址: ${env.BUILD_URL}"
