@@ -5,6 +5,8 @@ services:
       dockerfile: Dockerfile
     image: iot-jenkins:2.567-jdk21-python3
     container_name: jenkins
+    group_add:
+      - "${DOCKER_GID:-991}"
     ports:
       - "${JENKINS_HTTP_PORT}:8080"
       - "${JENKINS_AGENT_PORT}:50000"

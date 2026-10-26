@@ -12,6 +12,7 @@ JENKINS_DOCKERFILE = (REPO_ROOT / "deploy" / "jenkins" / "Dockerfile").read_text
 JENKINS_COMPOSE = (REPO_ROOT / "deploy" / "jenkins" / "compose.yml").read_text(
     encoding="utf-8"
 )
+START_SCRIPT = (REPO_ROOT / "scripts" / "start.sh").read_text(encoding="utf-8")
 
 
 class ReleasePipelineContractTests(unittest.TestCase):
@@ -90,6 +91,13 @@ class ReleasePipelineContractTests(unittest.TestCase):
             "release-metadata.properties,ci/release-firmware.sh",
             JENKINSFILE,
         )
+
+    def test_jenkins_receives_the_host_docker_socket_group(self):
+        self.assertIn("group_add:", JENKINS_COMPOSE)
+        self.assertIn('${DOCKER_GID:-991}', JENKINS_COMPOSE)
+        self.assertIn("DOCKER_SOCKET=/var/run/docker.sock", START_SCRIPT)
+        self.assertIn("DOCKER_GID=\"$(stat -c '%g'", START_SCRIPT)
+        self.assertIn("export DOCKER_GID", START_SCRIPT)
 
 
 if __name__ == "__main__":
