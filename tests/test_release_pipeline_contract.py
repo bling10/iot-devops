@@ -12,6 +12,9 @@ JENKINS_DOCKERFILE = (REPO_ROOT / "deploy" / "jenkins" / "Dockerfile").read_text
 JENKINS_COMPOSE = (REPO_ROOT / "deploy" / "jenkins" / "compose.yml").read_text(
     encoding="utf-8"
 )
+IOT_COMPOSE = (REPO_ROOT / "deploy" / "iot" / "compose.yml").read_text(
+    encoding="utf-8"
+)
 START_SCRIPT = (REPO_ROOT / "scripts" / "start.sh").read_text(encoding="utf-8")
 
 
@@ -98,6 +101,13 @@ class ReleasePipelineContractTests(unittest.TestCase):
         self.assertIn("DOCKER_SOCKET=/var/run/docker.sock", START_SCRIPT)
         self.assertIn("DOCKER_GID=\"$(stat -c '%g'", START_SCRIPT)
         self.assertIn("export DOCKER_GID", START_SCRIPT)
+
+    def test_telegraf_receives_the_host_docker_socket_group(self):
+        telegraf_service = IOT_COMPOSE.split("  telegraf:\n", 1)[1].split(
+            "\n  grafana:\n", 1
+        )[0]
+        self.assertIn("group_add:", telegraf_service)
+        self.assertIn('${DOCKER_GID:-991}', telegraf_service)
 
 
 if __name__ == "__main__":

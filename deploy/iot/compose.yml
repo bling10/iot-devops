@@ -88,6 +88,8 @@ services:
   telegraf:
     image: telegraf:1.39.0-alpine
     container_name: iot-telegraf
+    group_add:
+      - "${DOCKER_GID:-991}"
     environment:
       INFLUXDB_TOKEN: "${INFLUXDB_TOKEN}"
       INFLUXDB_ORG: "${INFLUXDB_ORG}"
