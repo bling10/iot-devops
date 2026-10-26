@@ -30,6 +30,9 @@ install -d -m 0755 -o 1883 -g 1883 -- "${MQTT_LOG_DIR}"
 if [[ -f "${MQTT_LOG_DIR}/mosquitto.log" && ! -L "${MQTT_LOG_DIR}/mosquitto.log" ]]; then
   chown 1883:1883 -- "${MQTT_LOG_DIR}/mosquitto.log"
 fi
+SIMULATOR_UID=10001
+SIMULATOR_STATE_DIR="${RUNTIME_ROOT}/simulator"
+install -d -m 0755 -o "${SIMULATOR_UID}" -g "${SIMULATOR_UID}" -- "${SIMULATOR_STATE_DIR}"
 
 docker compose --env-file "${ENV_FILE}" -f "${PROJECT_ROOT}/deploy/gitlab/compose.yml" up -d
 docker compose --env-file "${ENV_FILE}" -f "${PROJECT_ROOT}/deploy/jenkins/compose.yml" up -d

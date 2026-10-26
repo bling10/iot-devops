@@ -1,9 +1,9 @@
 ## Handoff Checkpoint
 
-**更新时间**: 2026-10-25
+**更新时间**: 2026-10-26
 **当前目标**: 完成 MQTT OTA v1 的多设备最小闭环
-**当前阶段**: Wave 3 正式 dry-run 已完成；Jenkins 运行镜像与阶段重启加固已实现，待部署复验
-**完成度**: Wave 3 为 100%；流水线加固为 70%（代码、契约测试和隔离镜像验证完成，正式部署与 Restart from Stage 未验证）
+**当前阶段**: Python 多设备模拟器已实现；Jenkins Docker 权限已修复，Docker daemon 代理待处理
+**完成度**: 模拟器代码与本地测试 100%；服务器端到端验证待 Docker 代理恢复后执行
 
 ### 已完成
 
@@ -15,13 +15,14 @@
 - 正式 Jenkins Job `#42` 已完成构建、人工审批和两个目标设备的 dry-run。
 - 自定义 Jenkins 镜像固定安装 Python 3；发布上下文已随 stash 保存并在 Release 阶段恢复。
 - 自定义镜像已在服务器隔离构建验证：默认用户为 `jenkins`（UID 1000），Python 为 `/usr/bin/python3` 3.13.5；未影响正式容器。
+- Python 模拟器支持 5 个设备、真实 HTTP 下载、大小/SHA-256 校验、状态持久化和故障注入；本地 31 个测试通过。
+- 正式 Jenkins 已重建，补充组 GID 991 可访问 Docker API，Server 版本为 29.5.3。
 
 ### 未完成
 
-- 提交并同步当前流水线加固改动。
-- 在正式 Compose 目录构建自定义 Jenkins 镜像，重建容器后确认 Python 3 持久存在。
+- 停用宿主机 Docker daemon 的失效代理并重启 Docker；该操作会短暂影响全部容器，等待明确授权。
+- 构建并启动正式模拟器容器，完成 MQTT OTA 五设备端到端验证。
 - 从 Release OTA 阶段重启一次构建，验证仍使用原始版本和制品目录。
-- 后续实现多设备模拟器并验证设备状态回执。
 
 ### 关键决策
 
@@ -34,15 +35,15 @@
 
 - **首读文件**: `Jenkinsfile`、`ci/release-firmware.sh`、`docs/protocol/mqtt-ota-v1.md`
 - **关键命令**: `py -3 -B -m unittest discover -s tests -p "test_*.py" -v`
-- **验证路径**: 部署自定义 Jenkins 镜像后检查 `python3 --version`，完整运行一次 dry-run，再从 Release OTA 阶段重启并核对原始版本。
+- **验证路径**: Docker 代理恢复后拉取 ESP-IDF 镜像，启动模拟器并观察 5 台设备状态，再从 Release OTA 阶段重启并核对原始版本。
 
 ### 阻塞项
 
-- 当前加固版 Jenkinsfile 尚未由正式 Jenkins 解析；需要同步并通过真实 Job 验证 Groovy 和阶段重启路径。
+- Docker daemon 的 systemd drop-in 指向不可达代理 `192.168.100.1:7890`；修改后必须重启 Docker。
 
 ## 交接
 
-- **已完成项**（带验证证据）：Wave 3 正式 Job `#42` dry-run 通过；Jenkins 固定 Python 3 镜像和发布元数据恢复代码已通过本地契约测试。
-- **相关文件**（精确路径 + 行号）：`deploy/jenkins/Dockerfile:1`、`deploy/jenkins/compose.yml:3`、`Jenkinsfile:25`、`tests/test_release_pipeline_contract.py:1`。
-- **未完成项**（下一步 + 入口）：提交同步加固改动，构建并部署 Jenkins 镜像，再复验完整 dry-run 和 Release OTA 阶段重启。
-- **阻塞项**（决策点）：服务器 Jenkins 容器重建会影响正在运行的 Job，部署前应确认当前无活跃构建。
+- **已完成项**（带验证证据）：Jenkins Docker API 权限恢复；Python 模拟器与本地 31 个测试完成。
+- **相关文件**（精确路径 + 行号）：`deploy/jenkins/compose.yml:7`、`scripts/start.sh:8`、`simulator/main.py:1`、`simulator/device.py:1`。
+- **未完成项**（下一步 + 入口）：停用 Docker daemon 失效代理、重启 Docker 并复验全部容器，再构建模拟器。
+- **阻塞项**（决策点）：重启 Docker 会短暂中断全部容器，需用户明确授权。

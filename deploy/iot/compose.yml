@@ -38,6 +38,30 @@ services:
           cpus: "0.5"
           memory: 512M
 
+  iot-simulator:
+    image: iot-device-simulator:1.0.0
+    build:
+      context: ../../simulator
+    container_name: iot-simulator
+    environment:
+      MQTT_HOST: iot-mqtt
+      MQTT_PORT: "1883"
+      SIMULATOR_CONFIG: /app/simulator/config.json
+      SIMULATOR_STATE_DIR: /app/state
+    volumes:
+      - "${RUNTIME_ROOT}/simulator:/app/state"
+    depends_on:
+      iot-mqtt:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - iot-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
   influxdb:
     image: influxdb:2.7.12-alpine
     container_name: iot-influxdb

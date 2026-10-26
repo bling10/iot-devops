@@ -1,0 +1,40 @@
+{
+  "mqtt": {
+    "host": "iot-mqtt",
+    "port": 1883,
+    "keepalive_sec": 60
+  },
+  "settings": {
+    "state_dir": "/app/state",
+    "telemetry_interval_sec": 5,
+    "download_timeout_sec": 15,
+    "reboot_delay_sec": 2
+  },
+  "devices": [
+    {
+      "device_id": "sim-001",
+      "initial_version": "v1.0.42",
+      "fault_mode": "none"
+    },
+    {
+      "device_id": "sim-002",
+      "initial_version": "v1.0.42",
+      "fault_mode": "download_failed"
+    },
+    {
+      "device_id": "sim-003",
+      "initial_version": "v1.0.42",
+      "fault_mode": "sha256_mismatch"
+    },
+    {
+      "device_id": "sim-004",
+      "initial_version": "v1.0.42",
+      "fault_mode": "health_check_failed"
+    },
+    {
+      "device_id": "sim-005",
+      "initial_version": "v1.0.42",
+      "fault_mode": "silent_after_received"
+    }
+  ]
+}

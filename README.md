@@ -162,10 +162,10 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 | 模块 | 状态 | 当前证据与剩余边界 |
 | --- | --- | --- |
 | 仓库与部署结构 | 已完成 | Wave 3 已由正式 Jenkins Job 读取并完成 dry-run；当前本地正在增加 Jenkins 固定运行镜像和阶段重启兼容性，尚未部署。源码、Compose、运行数据、固件制品和秘密配置已分目录。 |
-| Jenkins 构建与发布 | Wave 3 dry-run 已通过，运行环境加固待部署 | 正式 Job `#42` 已完成构建、固件校验、人工审批和两个目标设备的 dry-run。当前代码新增包含 Python 3 的自定义 Jenkins 镜像，并把原始版本、制品目录、摘要、目标设备和发布模式随 stash 保存；需要部署后复验容器重建和 Restart from Stage。 |
+| Jenkins 构建与发布 | Wave 3 dry-run 已通过，运行环境加固已部署 | 正式 Job `#42` 已完成构建、固件校验、人工审批和两个目标设备的 dry-run。包含 Python 3 的自定义 Jenkins 镜像已经部署；容器通过宿主机 Docker socket 的实际 GID 获得 API 权限，重启后的权限访问已经复验。Restart from Stage 仍待正式 Job 复验。 |
 | ESP32 OTA 与回滚 | 正确性修复已构建，待真机复验 | `main.c` 已移除 HTTP 句柄释放后使用，下载错误、长度不符或 SHA-256 不符会中止 OTA；回滚健康检查只对 `PENDING_VERIFY` 镜像运行，并以业务任务、MQTT、订阅和遥测确认作为联合条件。已在服务器使用固定 ESP-IDF 5.5 镜像完成完整编译与固件门禁验证，但下载中断、摘要不匹配和健康检查超时仍需真实 ESP32 故障注入。 |
 | 遥测与监控 | 已接入，运行待复验 | 固件遥测代码和 Telegraf、InfluxDB、Grafana 的服务配置已存在；实时面板和端到端数据入库没有在本轮重新检查。真实温湿度传感器尚未接入。 |
-| 设备模拟器 | 基础版 | `simulator/mock-esp32.sh` 目前只发送上线状态和温湿度遥测；尚不支持多 `device_id`、接收 OTA 指令或上报升级结果。 |
+| 设备模拟器 | Python 版本已实现，待服务器端到端复验 | `simulator/` 已支持 5 个独立设备、v1 指令订阅、真实 HTTP 流式下载、大小与 SHA-256 校验、阶段回执、版本状态持久化和故障注入；单元及本地 HTTP 集成测试已通过，尚未在服务器 Compose 中与正式 Jenkins 发布联调。 |
 | 发布协调后端 | 待实现 | 目标职责、状态模型和验收口径已写入本文；仓库中尚无后端入口、持久化模式、API 测试或部署配置。 |
 | MQTT 文件日志 | 2026-10-15 曾验证 | 当时日志目录及文件对 UID 1883 可写，`iot-mqtt` 为 `healthy`；`scripts/start.sh` 已加入权限初始化。本轮未复查服务器运行状态。 |
 | 质量、安全与论文材料 | 部分完成 | 流水线已生成镜像报告、容量报告、SHA-256、`manifest.json` 和完整 v1 `ota-notify.json`；9 个 Python 契约测试及发布脚本异常路径测试通过。设备端大小/SHA-256 校验及最小 OTA 状态回执已通过编译，但仍待真机复验；完整源码静态分析、令牌轮换和后端最终结果闭环仍待完成。 |
@@ -180,6 +180,8 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 - **2026-10-25（多设备发布脚本）**：9 个 Python 契约测试、Linux Bash 语法检查、伪 Docker 发布行为测试全部通过；真实 Mosquitto Broker 上 `sim-ci-001` 与 `sim-ci-003` 各收到一条有效 v1 指令。测试只使用临时发布目录和非 Retain 测试 Topic，没有触发实体设备 OTA。
 - **2026-10-25（正式 Jenkins dry-run）**：正式 Job `#42` 完成构建、人工审批和 Release OTA 演练；版本为 `v1.0.42`，SHA-256 为 `bef12049b02e1f92a139446671dc105f290ffb8483bf6b153d95ca6eb11247b8`，目标为 `sim-001`、`sim-003`。该次运行没有复制正式固件、没有发送 MQTT 指令，也没有触发设备升级。
 - **2026-10-25（Jenkins 运行环境隔离验证）**：服务器临时目录成功构建 `iot-jenkins:2.567-jdk21-python3-test`，镜像默认用户仍为 `jenkins`（UID 1000），`python3` 位于 `/usr/bin/python3`，版本为 3.13.5。验证未重建正式 Jenkins 容器；测试镜像和临时目录已清理。
+- **2026-10-25（Python 多设备模拟器）**：实现 5 个逻辑设备和 6 种行为模式；自动测试全部通过，其中下载测试使用本地 HTTP 服务真实传输固件并验证大小与 SHA-256。当前电脑没有 Docker；已在临时目录安装固定的 Paho MQTT 2.1.0 并验证 5 个客户端能够创建，服务器上的容器构建、Broker 连接和 Jenkins 非 dry-run 联调仍待完成。
+- **2026-10-26（Jenkins 重启后 Docker 权限修复）**：确认宿主机 `/var/run/docker.sock` 为 `root:docker`、GID `991`、权限 `0660`，而旧 Jenkins 只有 GID `1000`。Compose 增加 socket 补充组，启动脚本动态读取实际 GID；重建后 Jenkins 显示 `groups=1000,991`，容器内 Docker API 返回 Server `29.5.3`。随后镜像拉取越过权限检查，但暴露出宿主机 Docker daemon 仍配置失效代理 `192.168.100.1:7890`，该代理修复需重启全部 Docker 容器，尚未执行。
 
 ## 当前限制
 
@@ -192,7 +194,8 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 - Wi-Fi、MQTT 地址及部分服务凭据仍存在硬编码，后续需要迁移到 NVS、环境变量和 Jenkins Credentials。
 - OTA 已使用设备专属 Topic，但尚未实现设备分组、灰度比例和批次暂停。
 - Jenkins 发布 MQTT 消息后只记录“指令已发布”，尚未等待设备返回最终升级结果。
-- Jenkins 自定义 Python 3 镜像与阶段重启元数据修复已在本地实现，尚未部署到服务器；部署前仍依赖当前容器状态，Restart from Stage 修复也未由正式 Job 复验。
+- Jenkins 自定义 Python 3 镜像和 Docker socket 补充组已经部署；发布元数据的 Restart from Stage 修复仍未由正式 Job 复验。
+- 宿主机 Docker daemon 的 systemd drop-in 仍指向不可达代理 `192.168.100.1:7890`；Docker API 权限已恢复，但拉取未缓存镜像仍会超时。停用该代理需要重启 Docker，并短暂影响全部容器。
 - 尚无发布协调后端，也没有持久化的“发布任务—目标设备—最终结果”关联记录；当前设备离线时会错过非 Retain 指令。
 - 源码仓库、容器持久化数据、固件制品和本机秘密配置已经分离；旧目录暂时保留在归档区，待稳定运行后清理。
 
@@ -248,12 +251,25 @@ cd /data/devops/iot-devops
 ./scripts/stop.sh
 ```
 
-启动模拟遥测前，请确认 `iot-mqtt` 容器处于健康状态：
+Python 模拟器已经包含在 IoT Compose 中。默认启动 `sim-001` 至 `sim-005`，其状态保存在 `${RUNTIME_ROOT}/simulator`：
 
 ```bash
 cd /data/devops/iot-devops
-./simulator/mock-esp32.sh
+docker compose --env-file /data/devops/secrets/iot-devops.env \
+  -f deploy/iot/compose.yml up -d --build iot-simulator
+docker logs -f iot-simulator
 ```
+
+可在另一个终端直接观察 OTA 回执：
+
+```bash
+docker exec iot-mqtt mosquitto_sub \
+  -t 'iot/v1/devices/+/ota/status' -q 1 -v
+```
+
+默认故障组合位于 `simulator/config.json`：`sim-001` 正常升级，`sim-002` 模拟下载失败，`sim-003` 在真实下载后模拟摘要不符，`sim-004` 模拟新版本健康检查失败后回滚，`sim-005` 在 `received` 后断开以供后端判定超时。旧的 `simulator/mock-esp32.sh` 仅用于兼容早期遥测演示，不参与 MQTT OTA v1 验收。
+
+实现依据为 [Eclipse Paho Python 官方文档](https://eclipse.dev/paho/clients/python/docs/)、[Python `urllib.request` 官方文档](https://docs.python.org/3/library/urllib.request.html)、[Python `hashlib` 官方文档](https://docs.python.org/3/library/hashlib.html) 和 [ESP-IDF OTA 回滚官方文档](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/system/ota.html)。Paho 固定为 `2.1.0`，使用 Callback API v2；每台设备在 `on_connect` 中恢复订阅，状态消息使用 QoS 1 且等待发布确认。HTTP 下载明确绕过环境代理，避免内网固件地址被系统代理改写。
 
 ## OTA 消息格式
 
@@ -605,11 +621,11 @@ Jenkins 接入发布后端
 
 | 设备 | 预设行为 | 预期终态 |
 | --- | --- | --- |
-| `esp32-01` | 正常下载、校验和重启 | `healthy` |
-| `esp32-02` | 模拟 HTTP 下载失败 | `failed` |
-| `esp32-03` | 模拟 SHA-256 不一致 | `failed` |
-| `esp32-04` | 新版本健康检查失败 | `rolled_back` |
-| `esp32-05` | 接收指令后不再回执 | `timed_out`，由后端判定 |
+| `sim-001` | 正常下载、校验和重启 | `healthy` |
+| `sim-002` | 模拟 HTTP 下载失败 | `failed` |
+| `sim-003` | 真实下载后模拟 SHA-256 不一致 | `failed` |
+| `sim-004` | 新版本健康检查失败 | `rolled_back` |
+| `sim-005` | 上报 `received` 后断开 | `timed_out`，由后端判定 |
 
 **退出条件**：一次发布能够同时得到成功、失败、回滚和超时结果；所有消息都能用 `release_id` 与 `device_id` 检索。模拟结果只用于证明协议和平台逻辑，不作为真实 Flash 或 Bootloader 的证据。
 
@@ -757,9 +773,9 @@ Jenkins 记录 RELEASED 并结束
 
 ### 当前应立即执行的任务
 
-下一步只推进一件事：**部署并验证 Jenkins 固定 Python 3 镜像与阶段重启元数据，然后开始 Python 多设备模拟器。**
+下一步只推进一件事：**在服务器构建并启动 Python 多设备模拟器，观察 5 台设备遥测，再用隔离测试固件完成一次 MQTT OTA v1 端到端联调。**
 
-正式 Jenkins Job `#42` 的 dry-run 已通过。当前先保证 Jenkins 容器重建后仍有 Python 3，并验证从 Release OTA 阶段重启时仍使用原始构建的版本和制品目录；通过后再实现 Python 多设备模拟器。
+正式 Jenkins Job `#42` 的 dry-run 已通过，模拟器代码和自动测试已经完成。下一步先验证 Compose 构建、Paho 到 Mosquitto 的连接以及 `received → downloading → verified → rebooting → healthy` 正常路径；随后再验证下载失败、摘要不符、回滚和无回执场景。该联调不替代真实 ESP32 的 Flash 与 Bootloader 证据。
 
 ## 后续工作简版路线
 

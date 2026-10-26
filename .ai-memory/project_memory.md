@@ -152,6 +152,27 @@
 
 当发布协调后端或独立 Release Job 接管已验证制品时，移除 Jenkins 内的发布上下文恢复逻辑；若 Jenkins 节点改为外部 Agent，则把 Python 3 依赖迁移到对应固定 Agent 镜像。
 
+## Decision Record: Python 多设备模拟器与 Jenkins Docker socket 权限
+
+**日期**: 2026-10-26
+
+### 决策
+
+- 使用单进程、多 Paho MQTT Client 模拟 5 台设备，每台设备拥有独立 Topic、版本、状态文件和 OTA 互斥锁。
+- 固件通过标准库 HTTP 流式下载并校验实际大小和 SHA-256；重启与 Bootloader 回滚只做明确标注的状态模拟。
+- Paho 固定为 2.1.0，使用 Callback API v2；状态消息使用 QoS 1、非 Retain，并等待 PUBACK。
+- Jenkins 保持非 root 用户，通过 Compose `group_add` 获得宿主机 Docker socket 的数字 GID；`scripts/start.sh` 每次启动动态读取该 GID。
+
+### 验证证据与边界
+
+- 本地 Python 测试 31/31 通过，包含真实本地 HTTP 传输、摘要错误、健康失败回滚和并发 OTA 拒绝。
+- Jenkins 重建后为 `uid=1000`、补充组 `991`，容器内 Docker API 可返回 Server 29.5.3，原权限错误已消失。
+- 宿主机 Docker daemon 仍配置不可达代理，未缓存镜像拉取会超时；停用代理需要重启全部 Docker 容器，尚未获得明确授权。
+
+### 撤销条件
+
+当最小后端接管设备状态持久化与故障编排后，模拟器仅保留设备行为；当 Jenkins 迁移到独立 Agent 时，移除控制器容器的 Docker socket 挂载与补充组。
+
 ## Glossary
 
 - **源码检测**：对构建前的 C/C++ 源文件和编译诊断进行检查。
