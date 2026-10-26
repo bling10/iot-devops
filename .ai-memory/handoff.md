@@ -2,8 +2,8 @@
 
 **更新时间**: 2026-10-26
 **当前目标**: 完成 MQTT OTA v1 的多设备最小闭环
-**当前阶段**: Python 多设备模拟器已实现；Jenkins Docker 权限已修复，Docker daemon 代理待处理
-**完成度**: 模拟器代码与本地测试 100%；服务器端到端验证待 Docker 代理恢复后执行
+**当前阶段**: Python 多设备模拟器已部署；MQTT、状态持久化和 Telegraf/InfluxDB 入库已完成服务器验证
+**完成度**: 多设备模拟器主线 100%；正式 Jenkins 非 dry-run 定向发布待验证
 
 ### 已完成
 
@@ -15,13 +15,16 @@
 - 正式 Jenkins Job `#42` 已完成构建、人工审批和两个目标设备的 dry-run。
 - 自定义 Jenkins 镜像固定安装 Python 3；发布上下文已随 stash 保存并在 Release 阶段恢复。
 - 自定义镜像已在服务器隔离构建验证：默认用户为 `jenkins`（UID 1000），Python 为 `/usr/bin/python3` 3.13.5；未影响正式容器。
-- Python 模拟器支持 5 个设备、真实 HTTP 下载、大小/SHA-256 校验、状态持久化和故障注入；本地 31 个测试通过。
+- Python 模拟器支持 5 个设备、真实 HTTP 下载、大小/SHA-256 校验、状态持久化和故障注入；本地及服务器 33 个测试通过。
 - 正式 Jenkins 已重建，补充组 GID 991 可访问 Docker API，Server 版本为 29.5.3。
+- Docker daemon 失效代理已停用，核心容器在重启后恢复。
+- `iot-simulator` 已部署；5 台设备遥测、18 条 OTA 状态、异常注入和容器重启后的版本恢复均已验证。
+- Telegraf Docker socket 权限及 MQTT OTA v1 Topic 已修复；InfluxDB 查到 5 台设备遥测和按设备 `5/3/3/6/1` 的 OTA 状态。
 
 ### 未完成
 
-- 停用宿主机 Docker daemon 的失效代理并重启 Docker；该操作会短暂影响全部容器，等待明确授权。
-- 构建并启动正式模拟器容器，完成 MQTT OTA 五设备端到端验证。
+- 通过正式 Jenkins 人工审批，以非 dry-run 模式仅向 `sim-*` 设备完成一次定向发布。
+- 核对 Grafana 面板能否按 `device_id`、`stage` 和 `result` 展示多设备数据。
 - 从 Release OTA 阶段重启一次构建，验证仍使用原始版本和制品目录。
 
 ### 关键决策
@@ -35,15 +38,15 @@
 
 - **首读文件**: `Jenkinsfile`、`ci/release-firmware.sh`、`docs/protocol/mqtt-ota-v1.md`
 - **关键命令**: `py -3 -B -m unittest discover -s tests -p "test_*.py" -v`
-- **验证路径**: Docker 代理恢复后拉取 ESP-IDF 镜像，启动模拟器并观察 5 台设备状态，再从 Release OTA 阶段重启并核对原始版本。
+- **验证路径**: Jenkins 选择 `sim-001` 至 `sim-005` 且关闭 dry-run，审批后核对 MQTT/InfluxDB 18 条状态，再从 Release OTA 阶段重启并核对原始版本。
 
 ### 阻塞项
 
-- Docker daemon 的 systemd drop-in 指向不可达代理 `192.168.100.1:7890`；修改后必须重启 Docker。
+- 第三方 Docker registry mirror 当前返回 403；现有固定镜像已通过可信备用来源缓存，不阻塞本阶段，但后续新增镜像仍需治理。
 
 ## 交接
 
-- **已完成项**（带验证证据）：Jenkins Docker API 权限恢复；Python 模拟器与本地 31 个测试完成。
-- **相关文件**（精确路径 + 行号）：`deploy/jenkins/compose.yml:7`、`scripts/start.sh:8`、`simulator/main.py:1`、`simulator/device.py:1`。
-- **未完成项**（下一步 + 入口）：停用 Docker daemon 失效代理、重启 Docker 并复验全部容器，再构建模拟器。
-- **阻塞项**（决策点）：重启 Docker 会短暂中断全部容器，需用户明确授权。
+- **已完成项**（带验证证据）：Docker 代理停用；模拟器部署；33/33 测试；5 台遥测；两轮各 18 条 OTA 状态；InfluxDB 入库验证。
+- **相关文件**（精确路径 + 行号）：`deploy/iot/compose.yml:23`、`deploy/iot/telegraf/telegraf.conf:23`、`simulator/main.py:1`、`simulator/device.py:1`。
+- **未完成项**（下一步 + 入口）：通过 Jenkins 非 dry-run 仅发布到 `sim-*`，随后检查 Grafana 面板和 Restart from Stage。
+- **阻塞项**（决策点）：正式 Jenkins 发布仍需人工审批；失效 registry mirror 不影响已缓存镜像，但会影响未来首次拉取。

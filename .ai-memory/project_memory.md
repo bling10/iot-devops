@@ -165,9 +165,11 @@
 
 ### 验证证据与边界
 
-- 本地 Python 测试 31/31 通过，包含真实本地 HTTP 传输、摘要错误、健康失败回滚和并发 OTA 拒绝。
+- 本地及服务器 Python 测试 33/33 通过，包含真实 HTTP 传输、摘要错误、健康失败回滚、并发 OTA 拒绝、Telegraf Docker GID 和 v1 Topic 配置契约。
 - Jenkins 重建后为 `uid=1000`、补充组 `991`，容器内 Docker API 可返回 Server 29.5.3，原权限错误已消失。
-- 宿主机 Docker daemon 仍配置不可达代理，未缓存镜像拉取会超时；停用代理需要重启全部 Docker 容器，尚未获得明确授权。
+- 已停用宿主机 Docker daemon 的失效代理并重启 Docker；核心容器恢复，模拟器镜像已构建并运行。
+- 服务器隔离 OTA 两轮均收到 18 条状态；Telegraf 入库计数按设备为 `5/3/3/6/1`，与正常、下载失败、摘要不符、回滚和静默五种行为一致。
+- Docker daemon 中第三方 registry mirror 返回 403；本轮通过 Amazon ECR Public 的 Docker Official Images 路径获取固定 Python 基础镜像。后续新增镜像前应移除失效 mirror 或继续使用明确的可信来源。
 
 ### 撤销条件
 
