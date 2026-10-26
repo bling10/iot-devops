@@ -45,6 +45,22 @@ class SimulatorConfigTests(unittest.TestCase):
         self.assertIn("SIMULATOR_UID=10001", start_script)
         self.assertIn('install -d -m 0755 -o "${SIMULATOR_UID}"', start_script)
 
+    def test_telegraf_consumes_v1_device_topics(self):
+        telegraf_config = (
+            REPO_ROOT / "deploy" / "iot" / "telegraf" / "telegraf.conf"
+        ).read_text(encoding="utf-8")
+
+        for fragment in (
+            '"iot/v1/devices/+/telemetry"',
+            '"iot/v1/devices/+/ota/status"',
+            'name_override = "sensor_data"',
+            'name_override = "ota_status"',
+            'tag_keys = ["device_id", "version"]',
+            'tag_keys = ["device_id", "stage", "result"]',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, telegraf_config)
+
 
 if __name__ == "__main__":
     unittest.main()
