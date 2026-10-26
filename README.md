@@ -164,7 +164,7 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 | 仓库与部署结构 | 已完成 | Wave 3 已由正式 Jenkins Job 读取并完成 dry-run；当前本地正在增加 Jenkins 固定运行镜像和阶段重启兼容性，尚未部署。源码、Compose、运行数据、固件制品和秘密配置已分目录。 |
 | Jenkins 构建与发布 | Wave 3 dry-run 已通过，运行环境加固已部署 | 正式 Job `#42` 已完成构建、固件校验、人工审批和两个目标设备的 dry-run。包含 Python 3 的自定义 Jenkins 镜像已经部署；容器通过宿主机 Docker socket 的实际 GID 获得 API 权限，重启后的权限访问已经复验。Restart from Stage 仍待正式 Job 复验。 |
 | ESP32 OTA 与回滚 | 正确性修复已构建，待真机复验 | `main.c` 已移除 HTTP 句柄释放后使用，下载错误、长度不符或 SHA-256 不符会中止 OTA；回滚健康检查只对 `PENDING_VERIFY` 镜像运行，并以业务任务、MQTT、订阅和遥测确认作为联合条件。已在服务器使用固定 ESP-IDF 5.5 镜像完成完整编译与固件门禁验证，但下载中断、摘要不匹配和健康检查超时仍需真实 ESP32 故障注入。 |
-| 遥测与监控 | 多设备遥测已复验，面板待检查 | 服务器已同时收到 `sim-001` 至 `sim-005` 的独立 v1 遥测。Telegraf 已获得 Docker socket 补充组，并订阅 v1 遥测和 OTA 状态 Topic；InfluxDB 数据查询和 Grafana 面板仍待复验。真实温湿度传感器尚未接入。 |
+| 遥测与监控 | 多设备遥测及入库已复验，面板待检查 | 服务器已同时收到 `sim-001` 至 `sim-005` 的独立 v1 遥测。Telegraf 已获得 Docker socket 补充组，并订阅 v1 遥测和 OTA 状态 Topic；InfluxDB 已查到 5 台设备的 `sensor_data` 和一轮共 18 条 `ota_status`，Grafana 面板仍待复验。真实温湿度传感器尚未接入。 |
 | 设备模拟器 | 已部署并通过服务器端到端验证 | `simulator/` 已在服务器 Compose 中运行 5 个独立设备。隔离测试已验证正常升级、下载失败、SHA-256 不符、健康检查失败回滚和无最终回执五类行为，共收到 18 条 OTA 状态；容器重启后设备版本状态能够恢复。正式 Jenkins 非 dry-run 联调仍待完成。 |
 | 发布协调后端 | 待实现 | 目标职责、状态模型和验收口径已写入本文；仓库中尚无后端入口、持久化模式、API 测试或部署配置。 |
 | MQTT 文件日志 | 2026-10-15 曾验证 | 当时日志目录及文件对 UID 1883 可写，`iot-mqtt` 为 `healthy`；`scripts/start.sh` 已加入权限初始化。本轮未复查服务器运行状态。 |
@@ -182,7 +182,7 @@ Telegraf 同时采集宿主机 CPU、内存、磁盘以及 Docker 容器运行�
 - **2026-10-25（Jenkins 运行环境隔离验证）**：服务器临时目录成功构建 `iot-jenkins:2.567-jdk21-python3-test`，镜像默认用户仍为 `jenkins`（UID 1000），`python3` 位于 `/usr/bin/python3`，版本为 3.13.5。验证未重建正式 Jenkins 容器；测试镜像和临时目录已清理。
 - **2026-10-25（Python 多设备模拟器）**：实现 5 个逻辑设备和 6 种行为模式；自动测试全部通过，其中下载测试使用本地 HTTP 服务真实传输固件并验证大小与 SHA-256。当前电脑没有 Docker；已在临时目录安装固定的 Paho MQTT 2.1.0 并验证 5 个客户端能够创建，服务器上的容器构建、Broker 连接和 Jenkins 非 dry-run 联调仍待完成。
 - **2026-10-26（Jenkins 重启后 Docker 权限修复）**：确认宿主机 `/var/run/docker.sock` 为 `root:docker`、GID `991`、权限 `0660`，而旧 Jenkins 只有 GID `1000`。Compose 增加 socket 补充组，启动脚本动态读取实际 GID；重建后 Jenkins 显示 `groups=1000,991`，容器内 Docker API 返回 Server `29.5.3`。
-- **2026-10-26（多设备模拟器服务器联调）**：停用 Docker daemon 的失效代理并重启 Docker，GitLab、Jenkins、MQTT、Nginx、InfluxDB 和 Grafana 均恢复。使用 Amazon ECR Public 上的 Docker Official Images Python 镜像补齐本地基础镜像后，构建并启动 `iot-device-simulator:1.0.0`。服务器收到 5 台模拟设备遥测；一次隔离 OTA 测试收到 18 条状态，`sim-001` 升级为 `v1.0.43`，`sim-002` 下载失败，`sim-003` 摘要不符，`sim-004` 回滚到 `v1.0.42`，`sim-005` 在 `received` 后静默。重启模拟器后 5 台设备重新上线，版本状态持久化正确。Telegraf 的 Docker socket 权限及 v1 Topic 订阅同步修复，服务器自动测试 33/33 通过。该测试没有向真实 ESP32 Topic 发布指令。
+- **2026-10-26（多设备模拟器服务器联调）**：停用 Docker daemon 的失效代理并重启 Docker，GitLab、Jenkins、MQTT、Nginx、InfluxDB 和 Grafana 均恢复。使用 Amazon ECR Public 上的 Docker Official Images Python 镜像补齐本地基础镜像后，构建并启动 `iot-device-simulator:1.0.0`。服务器收到 5 台模拟设备遥测；一次隔离 OTA 测试收到 18 条状态，`sim-001` 正常升级，`sim-002` 下载失败，`sim-003` 摘要不符，`sim-004` 回滚，`sim-005` 在 `received` 后静默。重启模拟器后 5 台设备重新上线，版本状态持久化正确。Telegraf 的 Docker socket 权限及 v1 Topic 订阅同步修复；InfluxDB 查询到 5 台设备遥测，第二轮 OTA 的入库状态按设备计数为 `5/3/3/6/1`，合计 18 条。服务器自动测试 33/33 通过。测试没有向真实 ESP32 Topic 发布指令。
 
 ## 当前限制
 
