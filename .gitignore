@@ -39,13 +39,17 @@ firmware/**/compile_commands.json
 *.tgz
 *.bak
 
+# Local office documents and exports
+*.docx
+
 # IDE and OS local state
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
 .DS_Store
 Thumbs.db
 
-# Local AI session logs; keep project-level memory and handoff files trackable
-.ai-memory/*/
+# Local AI working memory
+.ai-memory/
